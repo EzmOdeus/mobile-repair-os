@@ -1,0 +1,579 @@
+'use client';
+
+import { useState } from 'react';
+import useSWR, { mutate } from 'swr';
+import Link from 'next/link';
+import { AlertTriangle, Package, ShieldCheck, TrendingDown, Wrench } from 'lucide-react';
+import { api, errorMessage, fetcher, qs } from '@/lib/api';
+import { formatDateTime, formatMoney, formatNumber, formatPercent } from '@/lib/format';
+import { WARRANTY_STATUS_LABELS } from '@/lib/constants';
+import { Badge, Card, CardHeader, EmptyState, Field, LoadingBlock, PageHeader, StatCard } from '@/components/ui';
+import { Modal } from '@/components/ui/Modal';
+import { useToast } from '@/components/ui/Toast';
+import { useAuth } from '@/lib/auth';
+
+interface WarrantyIntelligence {
+  totalClaims: number;
+  totalDeliveredTickets: number;
+  returnRatePct: number;
+  totalWarrantyCostEgp: number;
+  byStatus: { status: string; count: number; costEgp: number }[];
+  byFaultCategory: { faultCategory: string; claims: number; sameFaultClaims: number; sameFaultPct: number }[];
+  byTechnician: {
+    technicianId: string | null;
+    name: string;
+    claims: number;
+    sameFaultClaims: number;
+    avgDaysToReturn: number;
+    note: string;
+  }[];
+  topReturningDevices: { deviceId: string | null; device: string; claims: number; sameFaultClaims: number }[];
+}
+
+interface ClaimRow {
+  _id: string;
+  claimNumber: string;
+  status: string;
+  coverage: string;
+  symptom: string;
+  isSameFault: boolean;
+  misuseSuspected?: boolean;
+  daysSinceDelivery: number;
+  reportedAt: string;
+  repairCostEgp: number;
+  chargedToCustomerEgp: number;
+  chargedToSupplierEgp: number;
+  customerId?: { fullName: string; phone: string } | null;
+  deviceId?: { brand: string; model: string } | null;
+  originalTicketId?: { ticketNumber: string } | null;
+  originalTechnicianId?: { fullName: string } | null;
+}
+
+interface FailingPart {
+  partId: string;
+  name: string;
+  sku: string;
+  category: string;
+  grade: string;
+  unitsUsed: number;
+  failures: number;
+  failureRatePct: number;
+  estimatedLossEgp: number;
+}
+
+export default function WarrantyPage() {
+  const toast = useToast();
+  const { hasPermission } = useAuth();
+  const [tab, setTab] = useState<'claims' | 'intelligence'>('claims');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [page, setPage] = useState(1);
+  const [selectedClaim, setSelectedClaim] = useState<ClaimRow | null>(null);
+
+  const claimsKey = `/warranty/claims${qs({ status: statusFilter || undefined, page, limit: 20 })}`;
+  const { data: claims, error, isLoading } = useSWR<{ items: ClaimRow[]; meta: { total: number; page: number; pages: number } }>(
+    tab === 'claims' ? claimsKey : null,
+    fetcher,
+  );
+  const { data: intel } = useSWR<WarrantyIntelligence>(tab === 'intelligence' ? '/warranty/intelligence' : null, fetcher);
+  const { data: failing } = useSWR<FailingPart[]>(tab === 'intelligence' ? '/warranty/failing-parts' : null, fetcher);
+
+  return (
+    <div>
+      <PageHeader
+        title="الضمان والclaims"
+        subtitle="قياس معدلات العودة وربطها بالقطعة والفني والموديل"
+      />
+
+      <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          label="إجمالي claims الضمان"
+          value={formatNumber(claims?.meta.total ?? intel?.totalClaims ?? 0)}
+          icon={<ShieldCheck size={18} />}
+          tone="info"
+        />
+        <StatCard
+          label="معدل العودة"
+          value={formatPercent(intel?.returnRatePct ?? 0)}
+          hint={`من ${formatNumber(intel?.totalDeliveredTickets ?? 0)} إصلاح مُسلَّم`}
+          icon={<TrendingDown size={18} />}
+          tone={(intel?.returnRatePct ?? 0) > 5 ? 'warning' : 'success'}
+        />
+        <StatCard
+          label="تكلفة الضمان"
+          value={formatMoney(intel?.totalWarrantyCostEgp ?? 0)}
+          icon={<AlertTriangle size={18} />}
+          tone="danger"
+        />
+        <StatCard
+          label="قطع بمعدل فشل مرتفع"
+          value={formatNumber(failing?.length ?? 0)}
+          hint="تحتاج مراجعة المورد"
+          icon={<Package size={18} />}
+          tone={(failing?.length ?? 0) > 0 ? 'warning' : 'success'}
+        />
+      </div>
+
+      <Card className="mb-4">
+        <div className="flex flex-wrap items-center gap-2 border-b border-ink-100 px-3 py-2">
+          {[
+            ['claims', 'قائمة claims'],
+            ['intelligence', 'تحليلات الضمان'],
+          ].map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => setTab(value as typeof tab)}
+              className={`btn px-3 py-1.5 text-xs ${tab === value ? 'bg-brand-700 text-white' : 'text-ink-600 hover:bg-ink-100'}`}
+            >
+              {label}
+            </button>
+          ))}
+          {tab === 'claims' ? (
+            <select
+              className="input ms-auto w-auto text-xs"
+              value={statusFilter}
+              onChange={(e) => {
+                setStatusFilter(e.target.value);
+                setPage(1);
+              }}
+            >
+              <option value="">كل الحالات</option>
+              {Object.entries(WARRANTY_STATUS_LABELS).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          ) : null}
+        </div>
+
+        {tab === 'intelligence' ? (
+          <div className="card-pad space-y-5">
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div>
+                <h3 className="mb-2 text-sm font-bold text-ink-800">توزيع claims حسب الحالة</h3>
+                <div className="space-y-1.5">
+                  {intel?.byStatus?.map((row) => (
+                    <div key={row.status} className="flex items-center justify-between rounded-lg border border-ink-200 px-3 py-2 text-xs">
+                      <span>{WARRANTY_STATUS_LABELS[row.status] ?? row.status}</span>
+                      <span className="num font-bold">
+                        {row.count} · {formatMoney(row.costEgp)}
+                      </span>
+                    </div>
+                  ))}
+                  {!intel?.byStatus?.length ? <p className="text-xs text-ink-500">لا بيانات.</p> : null}
+                </div>
+              </div>
+
+              <div>
+                <h3 className="mb-2 text-sm font-bold text-ink-800">أكثر الأعطال عودة</h3>
+                <div className="space-y-1.5">
+                  {intel?.byFaultCategory?.slice(0, 8).map((row) => (
+                    <div key={row.faultCategory} className="rounded-lg border border-ink-200 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">{row.faultCategory || 'غير محدد'}</span>
+                        <span className="num font-bold">{row.claims}</span>
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-ink-500">
+                        نفس العطل: {row.sameFaultClaims} ({formatPercent(row.sameFaultPct)})
+                      </p>
+                    </div>
+                  ))}
+                  {!intel?.byFaultCategory?.length ? <p className="text-xs text-ink-500">لا بيانات.</p> : null}
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <h3 className="mb-2 text-sm font-bold text-ink-800">العودة حسب الفني</h3>
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>الفني</th>
+                      <th>claims</th>
+                      <th>نفس العطل</th>
+                      <th>متوسط الأيام حتى العودة</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {intel?.byTechnician?.map((row) => (
+                      <tr key={row.technicianId ?? 'unknown'}>
+                        <td className="text-xs font-medium">{row.name}</td>
+                        <td className="num text-xs">{row.claims}</td>
+                        <td className="num text-xs">{row.sameFaultClaims}</td>
+                        <td className="num text-xs">{row.avgDaysToReturn} يوم</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[11px] leading-relaxed text-amber-800">
+                تنبيه منهجي: هذه المؤشرات سياقية. بعض الأعطال أكثر تعقيدًا من غيرها، ولا يجب استخدامها كأداة عقابية آلية.
+              </p>
+            </div>
+
+            <div>
+              <h3 className="mb-2 text-sm font-bold text-ink-800">قطع تحتاج مراجعة المورد (Parts Quality Intelligence)</h3>
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>القطعة</th>
+                      <th>الوحدات المستخدمة</th>
+                      <th>مرات الفشل</th>
+                      <th>معدل الفشل</th>
+                      <th>خسارة تقديرية</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {failing?.length ? (
+                      failing.map((part) => (
+                        <tr key={part.partId}>
+                          <td className="text-xs">
+                            <p className="font-medium text-ink-800">{part.name}</p>
+                            <p className="text-ink-400" dir="ltr">
+                              {part.sku}
+                            </p>
+                          </td>
+                          <td className="num text-xs">{part.unitsUsed}</td>
+                          <td className="num text-xs">{part.failures}</td>
+                          <td>
+                            <span
+                              className={`badge border ${
+                                part.failureRatePct > 10
+                                  ? 'border-red-200 bg-red-50 text-red-700'
+                                  : 'border-amber-200 bg-amber-50 text-amber-800'
+                              }`}
+                            >
+                              {part.failureRatePct}%
+                            </span>
+                          </td>
+                          <td className="num text-xs text-red-600">{formatMoney(part.estimatedLossEgp)}</td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={5}>
+                          <EmptyState title="لا توجد قطع بمعدلات فشل مسجلة" icon={<Package size={20} />} />
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {intel?.topReturningDevices?.length ? (
+              <div>
+                <h3 className="mb-2 text-sm font-bold text-ink-800">أجهزة متكررة العودة</h3>
+                <div className="flex flex-wrap gap-2">
+                  {intel.topReturningDevices.map((device) => (
+                    <Link
+                      key={device.deviceId ?? device.device}
+                      href={device.deviceId ? `/devices/${device.deviceId}` : '#'}
+                      className="rounded-lg border border-ink-200 px-3 py-2 text-xs transition hover:border-brand-400"
+                    >
+                      <span className="block font-medium text-ink-800">{device.device}</span>
+                      <span className="block text-[11px] text-ink-500">
+                        {device.claims} claim · نفس العطل {device.sameFaultClaims}
+                      </span>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            {error ? (
+              <div className="border-b border-red-200 bg-red-50 p-4 text-sm text-red-700">{errorMessage(error)}</div>
+            ) : null}
+            {isLoading ? (
+              <LoadingBlock rows={6} />
+            ) : (
+              <div className="table-wrap">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>رقم claim</th>
+                      <th>العميل</th>
+                      <th>الجهاز</th>
+                      <th>التذكرة الأصلية</th>
+                      <th>العَرَض</th>
+                      <th>أيام بعد التسليم</th>
+                      <th>الحالة</th>
+                      <th>التكلفة</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {claims?.items?.length ? (
+                      claims.items.map((claim) => (
+                        <tr key={claim._id}>
+                          <td className="font-bold text-ink-900" dir="ltr">
+                            {claim.claimNumber}
+                          </td>
+                          <td className="text-xs">{claim.customerId?.fullName ?? '—'}</td>
+                          <td className="text-xs">
+                            {claim.deviceId ? `${claim.deviceId.brand} ${claim.deviceId.model}` : '—'}
+                          </td>
+                          <td className="text-xs">
+                            {claim.originalTicketId ? (
+                              <Link
+                                href={`/tickets/${(claim.originalTicketId as unknown as { _id?: string })._id ?? ''}`}
+                                className="text-brand-700 hover:underline"
+                                dir="ltr"
+                              >
+                                {claim.originalTicketId.ticketNumber}
+                              </Link>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="max-w-[16rem] text-xs">
+                            <p className="line-clamp-2 text-ink-600">{claim.symptom}</p>
+                            {claim.isSameFault ? (
+                              <Badge className="mt-1 border-amber-200 bg-amber-50 text-amber-800">نفس العطل</Badge>
+                            ) : null}
+                            {claim.misuseSuspected ? (
+                              <Badge className="mt-1 border-red-200 bg-red-50 text-red-700">اشتباه سوء استخدام</Badge>
+                            ) : null}
+                          </td>
+                          <td className="num text-xs">{claim.daysSinceDelivery}</td>
+                          <td>
+                            <Badge
+                              className={
+                                claim.status === 'resolved'
+                                  ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                  : claim.status === 'rejected'
+                                    ? 'border-red-200 bg-red-50 text-red-700'
+                                    : 'border-amber-200 bg-amber-50 text-amber-800'
+                              }
+                            >
+                              {WARRANTY_STATUS_LABELS[claim.status] ?? claim.status}
+                            </Badge>
+                          </td>
+                          <td className="num text-xs">{formatMoney(claim.repairCostEgp)}</td>
+                          <td>
+                            {hasPermission('warranty:manage') ? (
+                              <button type="button" className="btn-ghost text-xs" onClick={() => setSelectedClaim(claim)}>
+                                قرار
+                              </button>
+                            ) : null}
+                          </td>
+                        </tr>
+                      ))
+                    ) : (
+                      <tr>
+                        <td colSpan={9}>
+                          <EmptyState title="لا توجد claims" icon={<ShieldCheck size={22} />} />
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {claims && claims.meta.pages > 1 ? (
+              <div className="flex items-center justify-between border-t border-ink-100 px-4 py-3 text-xs text-ink-600">
+                <span>
+                  صفحة {claims.meta.page} من {claims.meta.pages}
+                </span>
+                <div className="flex gap-2">
+                  <button type="button" className="btn-secondary text-xs" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+                    السابق
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs"
+                    disabled={page >= claims.meta.pages}
+                    onClick={() => setPage((p) => p + 1)}
+                  >
+                    التالي
+                  </button>
+                </div>
+              </div>
+            ) : null}
+          </>
+        )}
+      </Card>
+
+      <ClaimDecisionModal
+        claim={selectedClaim}
+        onClose={() => setSelectedClaim(null)}
+        onDone={async () => {
+          setSelectedClaim(null);
+          await Promise.all([mutate(claimsKey), mutate('/warranty/intelligence')]);
+          toast.success('تم تسجيل قرار الضمان');
+        }}
+        onError={(message) => toast.error(message)}
+      />
+
+      <p className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-400">
+        <Wrench size={12} /> آخر تحديث: {formatDateTime(new Date())}
+      </p>
+    </div>
+  );
+}
+
+function ClaimDecisionModal({
+  claim,
+  onClose,
+  onDone,
+  onError,
+}: {
+  claim: ClaimRow | null;
+  onClose: () => void;
+  onDone: () => void | Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [form, setForm] = useState({
+    status: 'approved',
+    coverage: 'both',
+    decisionNotes: '',
+    rejectedReason: '',
+    repairCostEgp: '',
+    chargedToCustomerEgp: '0',
+    chargedToSupplierEgp: '0',
+    supplierClaimStatus: 'not_applicable',
+    resolutionNotes: '',
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  if (!claim) return null;
+
+  const submit = async () => {
+    setIsSubmitting(true);
+    try {
+      await api.post(`/warranty/claims/${claim._id}/decide`, {
+        status: form.status,
+        coverage: form.coverage,
+        decisionNotes: form.decisionNotes,
+        rejectedReason: form.rejectedReason,
+        repairCostEgp: Number(form.repairCostEgp) || 0,
+        chargedToCustomerEgp: Number(form.chargedToCustomerEgp) || 0,
+        chargedToSupplierEgp: Number(form.chargedToSupplierEgp) || 0,
+        supplierClaimStatus: form.supplierClaimStatus,
+        resolutionNotes: form.resolutionNotes,
+      });
+      await onDone();
+    } catch (err) {
+      onError(errorMessage(err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={`قرار الضمان — ${claim.claimNumber}`}
+      subtitle={`${claim.deviceId?.brand ?? ''} ${claim.deviceId?.model ?? ''} · ${claim.symptom.slice(0, 60)}`}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            إلغاء
+          </button>
+          <button type="button" className="btn-primary" onClick={submit} disabled={isSubmitting}>
+            {isSubmitting ? 'جارٍ الحفظ…' : 'تسجيل القرار'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="القرار">
+          <select className="input" value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })}>
+            {Object.entries(WARRANTY_STATUS_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="التغطية">
+          <select className="input" value={form.coverage} onChange={(e) => setForm({ ...form, coverage: e.target.value })}>
+            <option value="both">قطعة + مصنعية</option>
+            <option value="part">قطعة فقط</option>
+            <option value="labor">مصنعية فقط</option>
+            <option value="none">بدون تغطية</option>
+          </select>
+        </Field>
+        <Field label="تكلفة الإصلاح التعويضي">
+          <input
+            className="input"
+            type="number"
+            min={0}
+            value={form.repairCostEgp}
+            onChange={(e) => setForm({ ...form, repairCostEgp: e.target.value })}
+          />
+        </Field>
+        <Field label="محصّل من العميل">
+          <input
+            className="input"
+            type="number"
+            min={0}
+            value={form.chargedToCustomerEgp}
+            onChange={(e) => setForm({ ...form, chargedToCustomerEgp: e.target.value })}
+          />
+        </Field>
+        <Field label="محصّل من المورد" hint="عند تحميل المورد تكلفة القطعة المعيبة">
+          <input
+            className="input"
+            type="number"
+            min={0}
+            value={form.chargedToSupplierEgp}
+            onChange={(e) => setForm({ ...form, chargedToSupplierEgp: e.target.value })}
+          />
+        </Field>
+        <Field label="حالة claim المورد">
+          <select
+            className="input"
+            value={form.supplierClaimStatus}
+            onChange={(e) => setForm({ ...form, supplierClaimStatus: e.target.value })}
+          >
+            <option value="not_applicable">لا ينطبق</option>
+            <option value="requested">تم الطلب</option>
+            <option value="accepted">قبله المورد</option>
+            <option value="rejected">رفضه المورد</option>
+          </select>
+        </Field>
+        <div className="sm:col-span-2">
+          <Field label="أساس القرار">
+            <textarea
+              className="input min-h-[3rem]"
+              value={form.decisionNotes}
+              onChange={(e) => setForm({ ...form, decisionNotes: e.target.value })}
+            />
+          </Field>
+        </div>
+        {form.status === 'rejected' ? (
+          <div className="sm:col-span-2">
+            <Field label="سبب الرفض" required>
+              <textarea
+                className="input min-h-[3rem]"
+                value={form.rejectedReason}
+                onChange={(e) => setForm({ ...form, rejectedReason: e.target.value })}
+                placeholder="مثال: وجود آثار سوائل وكسر خارجي خارج نطاق الضمان"
+              />
+            </Field>
+          </div>
+        ) : null}
+        <div className="sm:col-span-2">
+          <Field label="ملاحظات الحل">
+            <textarea
+              className="input min-h-[3rem]"
+              value={form.resolutionNotes}
+              onChange={(e) => setForm({ ...form, resolutionNotes: e.target.value })}
+            />
+          </Field>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+void CardHeader;

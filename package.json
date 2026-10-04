@@ -1,0 +1,36 @@
+{
+  "name": "mobile-repair-os",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Mobile Repair OS Egypt - منصة إدارة وتشغيل مراكز صيانة الموبايل (Express + MongoDB + Next.js)",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run build:api && concurrently -n api,web -c cyan,magenta \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev --workspace @mros/api",
+    "dev:web": "npm run dev --workspace @mros/web",
+    "dev:watch": "concurrently -n api,web -c cyan,magenta \"npm run dev:watch --workspace @mros/api\" \"npm run dev --workspace @mros/web\"",
+    "build": "npm run build --workspace @mros/api && npm run build --workspace @mros/web",
+    "build:api": "npm run build --workspace @mros/api",
+    "build:web": "npm run build --workspace @mros/web",
+    "start": "concurrently -n api,web -c cyan,magenta \"npm run start --workspace @mros/api\" \"npm run start --workspace @mros/web\"",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "seed": "npm run build:api && npm run seed --workspace @mros/api",
+    "seed:reset": "npm run build:api && npm run seed:reset --workspace @mros/api",
+    "e2e": "npm run e2e --workspace @mros/api",
+    "fix:indexes": "npm run build:api && npm run fix:indexes --workspace @mros/api",
+    "fix:indexes:dry": "npm run build:api && npm run fix:indexes:dry --workspace @mros/api",
+    "fix:counters": "npm run build:api && npm run fix:counters --workspace @mros/api",
+    "fix:counters:dry": "npm run build:api && npm run fix:counters:dry --workspace @mros/api",
+    "test": "npm run test --workspace @mros/api",
+    "clean": "node -e \"const{rmSync}=require('fs');['node_modules','apps/api/node_modules','apps/web/node_modules','apps/api/dist','apps/web/.next'].forEach(p=>{try{rmSync(p,{recursive:true,force:true});console.log('deleted: '+p)}catch{}})\""
+  },
+  "devDependencies": {
+    "concurrently": "9.2.1"
+  },
+  "engines": {
+    "node": ">=20.9.0",
+    "npm": ">=10"
+  }
+}
