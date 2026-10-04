@@ -36,6 +36,7 @@
     "mongoose": "8.24.4",
     "morgan": "1.12.1",
     "multer": "2.4.0",
+    "pino": "10.4.0",
     "qrcode": "1.5.4",
     "swagger-ui-express": "5.0.1",
     "yaml": "2.9.1",
