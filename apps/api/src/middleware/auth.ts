@@ -6,6 +6,7 @@ import { ApiError } from '../utils/ApiError.js';
 import { enterTenantContext, runAsSystem, type TenantContext } from '../context/tenantContext.js';
 import { permissionsForRole, roleHasPermission, type Permission, type Role } from '../constants/roles.js';
 import { UserModel } from '../models/User.js';
+import { BranchModel } from '../models/Branch.js';
 import { logger } from '../config/logger.js';
 
 declare module 'express-serve-static-core' {
@@ -19,6 +20,8 @@ declare module 'express-serve-static-core' {
       permissions: Permission[];
       /** true إذا كانت الصلاحيات مُشتقة من الدور فقط (تعذّر قراءة تجاوزات المستخدم) */
       permissionsFromRoleOnly?: boolean;
+      /** true إذا كان المستخدم مقيّدًا بفرعه النشط في القوائم التشغيلية */
+      branchScoped?: boolean;
     };
     requestId?: string;
   }
@@ -97,7 +100,7 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
     return next(ApiError.unauthorized('توكن الدخول غير صحيح'));
   }
 
-  const branchId = payload.br && Types.ObjectId.isValid(payload.br) ? payload.br : null;
+  const tokenBranchId = payload.br && Types.ObjectId.isValid(payload.br) ? payload.br : null;
 
   void (async () => {
     try {
@@ -110,7 +113,7 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
        */
       const user = await runAsSystem(async () =>
         UserModel.findOne({ _id: payload.sub, organizationId: payload.org })
-          .select('role isActive fullName extraPermissions deniedPermissions')
+          .select('role isActive fullName extraPermissions deniedPermissions branchIds')
           .lean(),
       );
 
@@ -125,6 +128,44 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
         deniedPermissions: (user.deniedPermissions ?? []) as string[],
       });
 
+      /**
+       * تبديل الفرع عبر `x-branch-id`:
+       * - الأدوار المركزية (مالك/مدير نظام/محاسب/مشاهدة) تصل لأي فرع نشط في مؤسستها.
+       * - بقية الأدوار مقيَّدون بـ`branchIds` المخصصة لهم؛ محاولة فرع آخر = 403.
+       * - بلا هيدر: الفرع المثبّت في التوكن، وإلا أول فرع مسموح (أو الفرع الافتراضي للمالك).
+       */
+      const headerBranch = req.headers['x-branch-id'];
+      const requestedBranchId = typeof headerBranch === 'string' && headerBranch.trim() ? headerBranch.trim() : tokenBranchId;
+      if (requestedBranchId && !Types.ObjectId.isValid(requestedBranchId)) {
+        return next(ApiError.badRequest('معرّف الفرع غير صحيح'));
+      }
+
+      const assignedBranchIds = (user.branchIds ?? []).map((id) => String(id));
+      /** الأدوار المركزية ترى كل فروع المؤسسة، بما يوافق مبدّل الفرع في الواجهة */
+      const canAccessAllBranches = ['owner', 'admin', 'accountant', 'viewer'].includes(role);
+
+      let branchId: string | null = requestedBranchId;
+      if (branchId && !canAccessAllBranches && !assignedBranchIds.includes(branchId)) {
+        return next(ApiError.forbidden('لا تملك صلاحية العمل في هذا الفرع'));
+      }
+
+      if (branchId) {
+        const branch = await runAsSystem(() =>
+          BranchModel.findOne({ _id: branchId, organizationId: payload.org, isActive: true }).select('_id').lean(),
+        );
+        if (!branch) return next(ApiError.badRequest('الفرع غير موجود أو موقوف'));
+      } else if (canAccessAllBranches) {
+        const fallback = await runAsSystem(() =>
+          BranchModel.findOne({ organizationId: payload.org, isActive: true })
+            .sort({ isDefault: -1, createdAt: 1 })
+            .select('_id')
+            .lean(),
+        );
+        branchId = fallback ? String(fallback._id) : null;
+      } else if (assignedBranchIds.length) {
+        branchId = assignedBranchIds[0];
+      }
+
       req.auth = {
         userId: String(user._id),
         organizationId: String(payload.org),
@@ -132,6 +173,9 @@ export function authenticate(req: Request, _res: Response, next: NextFunction): 
         role,
         fullName: user.fullName ?? payload.name ?? '',
         permissions,
+        branchScoped: Boolean(
+          (typeof headerBranch === 'string' && headerBranch.trim()) || !['owner', 'admin', 'accountant', 'viewer'].includes(role),
+        ),
       };
 
       const context: TenantContext = {
@@ -190,6 +234,32 @@ export function requireRole(...roles: Role[]) {
 export function getAuth(req: Request) {
   if (!req.auth) throw ApiError.unauthorized();
   return req.auth;
+}
+
+/**
+ * الفرع الذي تُقيَّد به القوائم التشغيلية:
+ * - الأدوار التشغيلية (مدير فرع/استقبال/فني) تُقيَّد دائمًا بفرعها النشط.
+ * - المالك/المدير/المحاسب/المشاهدة بلا قيد، إلا إذا طلبوا فرعًا صراحةً في `branchId`.
+ */
+export function branchFilter(req: Request): Types.ObjectId | null {
+  const auth = req.auth;
+  if (!auth) return null;
+  const value = auth.branchScoped
+    ? auth.branchId
+    : typeof req.query.branchId === 'string' && req.query.branchId.trim()
+      ? req.query.branchId.trim()
+      : null;
+  return value ? new Types.ObjectId(value) : null;
+}
+
+/** يرفض أي عملية على فرع غير الفرع النشط للأدوار المقيّدة */
+export function requireBranchAccess(req: Request, branchId: unknown): void {
+  const auth = req.auth;
+  if (!auth) throw ApiError.unauthorized();
+  if (!auth.branchScoped) return;
+  if (!branchId || String(branchId) !== auth.branchId) {
+    throw ApiError.forbidden('هذه العملية تخص فرعًا آخر غير فرعك النشط');
+  }
 }
 
 /** فحص صلاحية داخل الـcontroller دون middleware */

@@ -7,11 +7,23 @@ import { RepairTicketModel } from '../models/RepairTicket.js';
 import { QualityCheckModel } from '../models/QualityCheck.js';
 import { WarrantyClaimModel } from '../models/WarrantyClaim.js';
 import { InvoiceModel } from '../models/Invoice.js';
+import {
+  SUBSCRIPTION_PAYMENT_METHOD_LABELS_AR,
+  SubscriptionPaymentModel,
+  type SubscriptionPaymentMethod,
+} from '../models/SubscriptionPayment.js';
+import { SubscriptionRenewalRequestModel } from '../models/SubscriptionRenewalRequest.js';
 import { ACTIVE_REPAIR_STATUSES } from '../constants/repair.js';
 import { assertBranchLimit, getPlanUsage } from '../services/planService.js';
+import { PLANS, type PlanKey } from '../constants/plans.js';
+import {
+  activateSubscription,
+  changePlan,
+  getSubscriptionState,
+} from '../services/subscriptionService.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok } from '../utils/asyncHandler.js';
-import { getAuth } from '../middleware/auth.js';
+import { branchFilter, getAuth } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { normalizeEgyptPhone } from '../validators/common.js';
@@ -46,7 +58,14 @@ export const getOrganization = async (req: Request, res: Response) => {
         monthlyTickets: planUsage.monthlyTickets,
       },
     },
+    /** حالة الاشتراك المحسوبة: الأيام المتبقية، المنع، مهلة السداد */
+    subscription: getSubscriptionState(organization.subscription),
   });
+};
+
+/** كتالوج الباقات مع أعلام التفويض (ذاتي/تجربة/تسعير مخصص) لشاشة الاشتراك */
+export const listPlanCatalog = (_req: Request, res: Response) => {
+  return ok(res, Object.values(PLANS));
 };
 
 export const updateOrganization = async (req: Request, res: Response) => {
@@ -73,6 +92,168 @@ export const updateOrganization = async (req: Request, res: Response) => {
   );
 
   return ok(res, organization.toObject());
+};
+
+/* ============================ الاشتراك والباقات ============================ */
+
+/** تغيير الباقة (ترقية/تخفيض) — الحالة والتواريخ لا تتغير هنا */
+export const changeSubscriptionPlan = async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const { plan } = req.body as { plan: PlanKey };
+
+  const state = await changePlan(auth.organizationId, plan, { source: 'self_service' });
+
+  await recordAudit(
+    {
+      action: 'update',
+      resource: 'Organization',
+      resourceId: String(auth.organizationId),
+      summary: `تغيير الباقة إلى «${state.plan.nameAr}»`,
+    },
+    req,
+  );
+
+  return ok(res, state);
+};
+
+/**
+ * تفعيل/تجديد ذاتي بعد دفع خارج المنصة (نقدًا/تحويل).
+ * طريقة الدفع ومرجع العملية إلزاميان ويُسجَّلان في سجل SubscriptionPayment.
+ * عند ربط Paymob لاحقًا، نجاح الـwebhook يستدعي subscriptionService.activateSubscription
+ * مع source='platform' دون المرور هنا.
+ */
+export const activateSubscriptionHandler = async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const body = req.body as {
+    plan: PlanKey;
+    months?: number;
+    paymentMethod: SubscriptionPaymentMethod;
+    paymentReference: string;
+    paymentNote?: string;
+  };
+  const months = body.months ?? 1;
+
+  const result = await activateSubscription(auth.organizationId, body.plan, {
+    months,
+    source: 'self_service',
+    recordedBy: auth.userId,
+    payment: {
+      method: body.paymentMethod,
+      reference: body.paymentReference,
+      note: body.paymentNote,
+    },
+  });
+
+  await recordAudit(
+    {
+      action: 'update',
+      resource: 'Organization',
+      resourceId: String(auth.organizationId),
+      summary: `تفعيل اشتراك باقة «${result.state.plan.nameAr}» حتى ${result.state.expiresAt?.toLocaleDateString('ar-EG') ?? '—'} (دفع: ${result.state.priceEgp * months} ج.م — مرجع ${body.paymentReference})`,
+    },
+    req,
+  );
+
+  return ok(res, { ...result.state, paymentId: result.paymentId });
+};
+
+/** سجل المدفوعات الخاص بالمركز (للمالك/الإدارة فقط) */
+export const listSubscriptionPayments = async (req: Request, res: Response) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 100);
+  const payments = await SubscriptionPaymentModel.find().sort({ paidAt: -1 }).limit(limit).lean();
+
+  return ok(
+    res,
+    payments.map((payment) => ({
+      id: String(payment._id),
+      plan: payment.plan,
+      amountEgp: payment.amountEgp,
+      months: payment.months,
+      method: payment.method,
+      methodLabelAr:
+        SUBSCRIPTION_PAYMENT_METHOD_LABELS_AR[payment.method as SubscriptionPaymentMethod] ?? payment.method,
+      reference: payment.reference,
+      note: payment.note,
+      periodStart: payment.periodStart,
+      periodEnd: payment.periodEnd,
+      paidAt: payment.paidAt,
+      source: payment.source,
+    })),
+  );
+};
+
+/** طلبات التجديد السابقة/المعلّقة للمركز */
+export const listRenewalRequests = async (_req: Request, res: Response) => {
+  const requests = await SubscriptionRenewalRequestModel.find()
+    .sort({ createdAt: -1 })
+    .limit(20)
+    .lean();
+
+  return ok(
+    res,
+    requests.map((request) => ({
+      id: String(request._id),
+      plan: request.plan,
+      months: request.months,
+      paymentMethod: request.paymentMethod,
+      paymentMethodLabelAr:
+        SUBSCRIPTION_PAYMENT_METHOD_LABELS_AR[request.paymentMethod as SubscriptionPaymentMethod] ??
+        request.paymentMethod,
+      paymentReference: request.paymentReference,
+      note: request.note,
+      status: request.status,
+      reviewNote: request.reviewNote,
+      reviewedAt: request.reviewedAt,
+      createdAt: request.createdAt,
+    })),
+  );
+};
+
+/** إنشاء طلب تجديد/عرض سعر — متاح حتى أثناء وضع القراءة فقط */
+export const createRenewalRequest = async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const body = req.body as {
+    plan: PlanKey;
+    months?: number;
+    paymentMethod?: SubscriptionPaymentMethod;
+    paymentReference?: string;
+    note?: string;
+  };
+
+  const existing = await SubscriptionRenewalRequestModel.findOne({ status: 'pending' }).lean();
+  if (existing) {
+    throw ApiError.conflict('يوجد طلب تجديد معلّق بالفعل لهذا المركز. انتظر مراجعة إدارة المنصة.', {
+      requestId: String(existing._id),
+    });
+  }
+
+  const request = await SubscriptionRenewalRequestModel.create({
+    organizationId: auth.organizationId,
+    requestedBy: auth.userId,
+    plan: body.plan,
+    months: body.months ?? 1,
+    paymentMethod: body.paymentMethod ?? 'bank_transfer',
+    paymentReference: body.paymentReference ?? '',
+    note: body.note ?? '',
+  });
+
+  await recordAudit(
+    {
+      action: 'create',
+      resource: 'SubscriptionRenewalRequest',
+      resourceId: String(request._id),
+      summary: `طلب تجديد باقة «${PLANS[body.plan]?.nameAr ?? body.plan}» لمدة ${body.months ?? 1} شهر`,
+    },
+    req,
+  );
+
+  return created(res, {
+    id: String(request._id),
+    status: request.status,
+    plan: request.plan,
+    months: request.months,
+    createdAt: request.createdAt,
+  });
 };
 
 /* ============================== الفروع ============================== */
@@ -174,6 +355,10 @@ export const listTechnicians = async (req: Request, res: Response) => {
   };
   if (query.isActive !== undefined) filter.isActive = query.isActive === 'true';
 
+  // الأدوار التشغيلية ترى فنيي فرعها النشط فقط، لا دليل الفنيين لكل الفروع
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchIds = scopedBranch;
+
   const technicians = await UserModel.find(filter)
     .select('fullName username phone role isActive technicianProfile branchIds')
     .sort({ fullName: 1 })
@@ -218,6 +403,8 @@ export const technicianPerformance = async (req: Request, res: Response) => {
 
   const ticketMatch: Record<string, unknown> = { assignedTechnicianId: { $ne: null } };
   if (hasRange) ticketMatch.createdAt = range;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) ticketMatch.branchId = scopedBranch;
 
   const [tickets, qcStats, claims] = await Promise.all([
     RepairTicketModel.aggregate<{
@@ -251,7 +438,7 @@ export const technicianPerformance = async (req: Request, res: Response) => {
       { $limit: 50 },
     ]),
     QualityCheckModel.aggregate<{ _id: Types.ObjectId; checks: number; passed: number; failed: number }>([
-      { $match: { technicianId: { $ne: null }, ...(hasRange ? { createdAt: range } : {}) } },
+      { $match: { technicianId: { $ne: null }, ...(scopedBranch ? { branchId: scopedBranch } : {}), ...(hasRange ? { createdAt: range } : {}) } },
       {
         $group: {
           _id: '$technicianId',
@@ -262,7 +449,7 @@ export const technicianPerformance = async (req: Request, res: Response) => {
       },
     ]),
     WarrantyClaimModel.aggregate<{ _id: Types.ObjectId; claims: number; sameFault: number; cost: number }>([
-      { $match: { originalTechnicianId: { $ne: null }, ...(hasRange ? { reportedAt: range } : {}) } },
+      { $match: { originalTechnicianId: { $ne: null }, ...(scopedBranch ? { branchId: scopedBranch } : {}), ...(hasRange ? { reportedAt: range } : {}) } },
       {
         $group: {
           _id: '$originalTechnicianId',
@@ -315,14 +502,25 @@ export const technicianPerformance = async (req: Request, res: Response) => {
 };
 
 /** الفنيون الأقل تحميلًا الآن (لتوزيع المهام) */
-export const availableTechnicians = async (_req: Request, res: Response) => {
-  const technicians = await UserModel.find({
+export const availableTechnicians = async (req: Request, res: Response) => {
+  const scopedBranch = branchFilter(req);
+
+  const filter: Record<string, unknown> = {
     isActive: true,
     $or: [{ role: 'technician' }, { 'technicianProfile.isTechnician': true }],
-  })
+  };
+  // الفني لا يظهر لفرع لا يخدمه — العضوية في branchIds هي مصدر الحقيقة
+  if (scopedBranch) filter.branchIds = new Types.ObjectId(scopedBranch);
+
+  const technicians = await UserModel.find(filter)
     .select('fullName technicianProfile branchIds')
     .lean();
 
+  /**
+   * الحمل يُحسب عالميًا حتى لو كانت القائمة مقيدة بفرع: سقف maxActiveJobs
+   * شخصي ويُفرض في assignTechnician عبر كل الفروع، فلو حسبناه لهذا الفرع وحده
+   * لعرضنا مقاعد متاحة يرفضها الـAPI عند الإسناد.
+   */
   const loads = await RepairTicketModel.aggregate<{ _id: Types.ObjectId; count: number }>([
     { $match: { status: { $in: ACTIVE_REPAIR_STATUSES }, assignedTechnicianId: { $ne: null } } },
     { $group: { _id: '$assignedTechnicianId', count: { $sum: 1 } } },

@@ -1,4 +1,5 @@
 import { Types } from 'mongoose';
+import { z } from 'zod';
 import { CustomerModel } from '../models/Customer.js';
 import { UserModel } from '../models/User.js';
 import { DeviceModel } from '../models/Device.js';
@@ -10,6 +11,7 @@ import type { RepairTicketDoc } from '../models/RepairTicket.js';
 import { REPAIR_STATUS_LABELS_AR, type RepairStatus } from '../constants/repair.js';
 import { money } from '../utils/money.js';
 import { getTenantContext } from '../context/tenantContext.js';
+import { normalizeEgyptPhone } from '../validators/common.js';
 import type { ActingUser } from './workflowService.js';
 
 /** القوالب العربية للرسائل - كل قالب مرتبط بحالة إصلاح */
@@ -112,10 +114,200 @@ export interface SendNotificationInput {
   trackingUrl?: string;
 }
 
+const whatsAppTemplateMapSchema = z.record(
+  z.string(),
+  z.object({
+    name: z.string().min(1),
+    language: z.string().min(2).default('ar'),
+    params: z.array(z.string()).default([]),
+  }),
+);
+
+type WhatsAppTemplateConfig = z.infer<typeof whatsAppTemplateMapSchema>[string];
+
+let templateMapCache: Record<string, WhatsAppTemplateConfig> | null = null;
+
+export function parseWhatsAppTemplateMap(raw: string): Record<string, WhatsAppTemplateConfig> {
+  try {
+    return whatsAppTemplateMapSchema.parse(JSON.parse(raw || '{}'));
+  } catch (err) {
+    logger.warn({ err }, 'WHATSAPP_TEMPLATE_MAP غير صالح — سيُستخدم النص الحر');
+    return {};
+  }
+}
+
+/** قوالب Meta المعتمدة — تُقرأ مرة واحدة، وأي خطأ إعداد لا يعطّل الإرسال النصي */
+export function whatsAppTemplateMap(): Record<string, WhatsAppTemplateConfig> {
+  if (!templateMapCache) templateMapCache = parseWhatsAppTemplateMap(env.WHATSAPP_TEMPLATE_MAP);
+  return templateMapCache;
+}
+
+class ProviderError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'ProviderError';
+  }
+}
+
+/** تحويل رقم مصري محلي إلى صيغة Meta الدولية (2010...) */
+export function normalizeWhatsAppPhone(input: string): string {
+  const local = normalizeEgyptPhone(input.trim());
+  const digits = local.replace(/\D/g, '');
+  if (/^01[0125]\d{8}$/.test(digits)) return `20${digits.slice(1)}`;
+  return digits;
+}
+
+export function resolveNotificationProvider(channel: SendNotificationInput['channel']): string {
+  if (channel === 'whatsapp') return env.WHATSAPP_MODE === 'cloud-api' ? 'whatsapp-cloud' : 'log';
+  if (channel === 'sms') return env.SMS_MODE === 'http' ? 'sms-http' : 'log';
+  return 'log';
+}
+
+/** بناء رسالة واتساب: قالب معتمد إن وُجد، وإلا نص حر */
+export function buildWhatsAppPayload(
+  to: string,
+  body: string,
+  templateKey?: string,
+  variables: Record<string, unknown> = {},
+  templates: Record<string, WhatsAppTemplateConfig> = whatsAppTemplateMap(),
+): Record<string, unknown> {
+  const template = templateKey ? templates[templateKey] : undefined;
+  const phone = normalizeWhatsAppPhone(to);
+  if (!/^\d{8,15}$/.test(phone)) throw new ProviderError(`رقم واتساب غير صالح: ${to || 'فارغ'}`, false);
+
+  if (template) {
+    const parameters = template.params.map((key) => ({
+      type: 'text',
+      text: String(variables[key] ?? '—').slice(0, 1024),
+    }));
+    return {
+      messaging_product: 'whatsapp',
+      to: phone,
+      type: 'template',
+      template: {
+        name: template.name,
+        language: { code: template.language },
+        ...(parameters.length ? { components: [{ type: 'body', parameters }] } : {}),
+      },
+    };
+  }
+
+  return {
+    messaging_product: 'whatsapp',
+    to: phone,
+    type: 'text',
+    text: { preview_url: true, body },
+  };
+}
+
+export function buildSmsPayload(to: string, message: string): Record<string, unknown> {
+  return {
+    to: normalizeEgyptPhone(to.trim()),
+    message,
+    sender: env.SMS_SENDER,
+  };
+}
+
+async function postJson(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number): Promise<Response> {
+  try {
+    return await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    throw new ProviderError(`تعذر الوصول لمزوّد الرسائل: ${(err as Error).message}`, true);
+  }
+}
+
+async function readJson(response: Response): Promise<Record<string, unknown>> {
+  try {
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+async function sendWhatsAppCloudApi(
+  to: string,
+  body: string,
+  templateKey?: string,
+  variables: Record<string, unknown> = {},
+): Promise<string> {
+  if (!env.WHATSAPP_PHONE_NUMBER_ID || !env.WHATSAPP_ACCESS_TOKEN) {
+    throw new ProviderError('إعدادات WhatsApp Cloud API غير مكتملة', false);
+  }
+  const payload = buildWhatsAppPayload(to, body, templateKey, variables);
+  const url = `https://graph.facebook.com/${env.WHATSAPP_API_VERSION}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const response = await postJson(
+    url,
+    { Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}` },
+    payload,
+    15_000,
+  );
+  if (!response.ok) {
+    const details = (await response.text()).slice(0, 500);
+    throw new ProviderError(
+      `WhatsApp API ${response.status}: ${details}`,
+      response.status === 429 || response.status >= 500,
+    );
+  }
+  const data = await readJson(response);
+  const messages = data.messages as { id?: string }[] | undefined;
+  return messages?.[0]?.id ?? '';
+}
+
+async function sendSmsHttp(to: string, message: string): Promise<string> {
+  if (!env.SMS_API_URL) throw new ProviderError('SMS_API_URL غير مضبوط', false);
+  const response = await postJson(
+    env.SMS_API_URL,
+    env.SMS_API_KEY ? { Authorization: `Bearer ${env.SMS_API_KEY}` } : {},
+    buildSmsPayload(to, message),
+    env.SMS_TIMEOUT_MS,
+  );
+  if (!response.ok) {
+    const details = (await response.text()).slice(0, 500);
+    throw new ProviderError(
+      `SMS gateway ${response.status}: ${details}`,
+      response.status === 408 || response.status === 429 || response.status >= 500,
+    );
+  }
+  const data = await readJson(response);
+  const nested = data.data as Record<string, unknown> | undefined;
+  const id = data.id ?? data.messageId ?? data.message_id ?? nested?.id;
+  return id ? String(id) : '';
+}
+
+interface DispatchInput {
+  channel: NonNullable<SendNotificationInput['channel']>;
+  toPhone: string;
+  body: string;
+  templateKey?: string;
+  variables: Record<string, unknown>;
+}
+
+async function dispatchNotification(input: DispatchInput): Promise<string> {
+  if (input.channel === 'whatsapp' && env.WHATSAPP_MODE === 'cloud-api') {
+    return sendWhatsAppCloudApi(input.toPhone, input.body, input.templateKey, input.variables);
+  }
+  if (input.channel === 'sms' && env.SMS_MODE === 'http') {
+    return sendSmsHttp(input.toPhone, input.body);
+  }
+  logger.info(
+    { type: input.channel, to: input.toPhone, body: input.body },
+    '[إشعار محلي] لم يُرسل لمزوّد خارجي (الوضع log)',
+  );
+  return '';
+}
+
 /**
- * إرسال إشعار.
- * الوضع الافتراضي WHATSAPP_MODE=log: يُسجَّل الإشعار في قاعدة البيانات وفي السجل
- * بدون استدعاء مزوّد خارجي، ما يتيح التشغيل الكامل محليًا.
+ * إرسال إشعار مع إعادة محاولة محدودة.
+ * الوضع الافتراضي log: يُسجَّل الإشعار في قاعدة البيانات وفي السجل بدون
+ * استدعاء مزوّد خارجي. عند ضبط واتساب/SMS يُرسل فعليًا، وتُحفظ حالة كل محاولة.
  */
 export async function sendNotification(input: SendNotificationInput): Promise<void> {
   const ctx = getTenantContext();
@@ -125,7 +317,8 @@ export async function sendNotification(input: SendNotificationInput): Promise<vo
   }
 
   const channel = input.channel ?? 'whatsapp';
-  const provider = channel === 'whatsapp' ? env.WHATSAPP_MODE : 'log';
+  const provider = resolveNotificationProvider(channel);
+  const variables = input.variables ?? {};
 
   const doc = await NotificationModel.create({
     organizationId: ctx.organizationId,
@@ -142,55 +335,47 @@ export async function sendNotification(input: SendNotificationInput): Promise<vo
     subject: input.subject ?? MESSAGE_TEMPLATES[input.templateKey ?? '']?.title ?? '',
     body: input.body,
     templateKey: input.templateKey ?? '',
-    variables: input.variables ?? {},
+    variables,
     provider,
     trackingUrl: input.trackingUrl ?? '',
     createdBy: ctx.actor.userId,
   });
 
-  try {
-    if (channel === 'whatsapp' && env.WHATSAPP_MODE === 'cloud-api') {
-      await sendWhatsAppCloudApi(doc.toPhone, doc.body);
-    } else {
-      logger.info(
-        { notificationId: String(doc._id), type: doc.type, to: doc.toPhone, body: doc.body },
-        '[إشعار محلي] لم يُرسل لمزوّد خارجي (WHATSAPP_MODE=log)',
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= env.NOTIFICATION_MAX_ATTEMPTS; attempt += 1) {
+    doc.attempts = attempt;
+    try {
+      doc.providerMessageId = await dispatchNotification({
+        channel,
+        toPhone: doc.toPhone,
+        body: doc.body,
+        templateKey: doc.templateKey,
+        variables,
+      });
+      doc.status = 'sent';
+      doc.sentAt = new Date();
+      doc.errorMessage = '';
+      lastError = null;
+      break;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      doc.status = 'failed';
+      doc.errorMessage = lastError.message.slice(0, 500);
+      const retryable = err instanceof ProviderError && err.retryable;
+      if (!retryable || attempt >= env.NOTIFICATION_MAX_ATTEMPTS) break;
+      logger.warn(
+        { notificationId: String(doc._id), attempt, err: lastError.message },
+        'فشل مؤقت في إرسال الإشعار — إعادة محاولة',
       );
+      await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
     }
-    doc.status = 'sent';
-    doc.sentAt = new Date();
-  } catch (err) {
-    doc.status = 'failed';
-    doc.errorMessage = (err as Error).message;
-    logger.error({ err, notificationId: String(doc._id) }, 'فشل إرسال الإشعار');
   }
 
-  doc.attempts = (doc.attempts ?? 0) + 1;
+  if (lastError) {
+    logger.error({ err: lastError, notificationId: String(doc._id) }, 'فشل إرسال الإشعار');
+  }
   await doc.save();
-}
-
-/** تكامل WhatsApp Business Cloud API - يُستخدم فقط عند ضبط المزود */
-async function sendWhatsAppCloudApi(to: string, body: string): Promise<void> {
-  if (!env.WHATSAPP_PHONE_NUMBER_ID || !env.WHATSAPP_ACCESS_TOKEN) {
-    throw new Error('إعدادات WhatsApp Cloud API غير مكتملة');
-  }
-  const url = `https://graph.facebook.com/v21.0/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.WHATSAPP_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      messaging_product: 'whatsapp',
-      to: to.replace(/^0/, '20'),
-      type: 'text',
-      text: { body },
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`WhatsApp API: ${response.status} ${await response.text()}`);
-  }
 }
 
 /**
@@ -201,7 +386,14 @@ export async function notifyTicketEvent(
   ticket: RepairTicketDoc,
   status: RepairStatus,
   actor?: ActingUser | null,
+  fromStatus?: RepairStatus,
 ): Promise<void> {
+  /**
+   * waiting_part → approved انتقال تشغيلي (رجوع للعمل بعد وصول القطعة) وليس
+   * قرارًا جديدًا من العميل؛ إرسال «وصلنا موافقتك» هنا يربك العميل ويكرر رسالة قديمة.
+   */
+  if (status === 'approved' && fromStatus === 'waiting_part') return;
+
   const type = STATUS_TO_NOTIFICATION[status];
   if (!type) return;
 

@@ -4,27 +4,42 @@ import { env } from '../config/env.js';
 import { validate } from '../middleware/validate.js';
 import { authenticate, requirePermission } from '../middleware/auth.js';
 import {
+  beginTwoFactorSetup,
   changePassword,
   createUser,
   deactivateUser,
+  disableTwoFactor,
+  enableTwoFactor,
+  forgotPassword,
   getUser,
   listUsers,
   login,
   me,
   refresh,
+  regenerateRecoveryCodes,
   registerOrganization,
+  resetPassword,
+  resetUserTwoFactor,
   rolesCatalog,
+  twoFactorStatus,
   updateProfile,
   updateUser,
+  verifyTwoFactorLogin,
 } from '../controllers/authController.js';
 import {
   changePasswordSchema,
   createUserSchema,
+  disableTwoFactorSchema,
+  forgotPasswordSchema,
   loginSchema,
   refreshSchema,
+  regenerateRecoveryCodesSchema,
   registerOrganizationSchema,
+  resetPasswordSchema,
+  twoFactorCodeSchema,
   updateProfileSchema,
   updateUserSchema,
+  verifyTwoFactorSchema,
 } from '../validators/authValidators.js';
 
 const router = Router();
@@ -42,18 +57,29 @@ const authLimiter = rateLimit({
 });
 
 router.post('/login', authLimiter, validate(loginSchema), login);
+router.post('/2fa/verify', authLimiter, validate(verifyTwoFactorSchema), verifyTwoFactorLogin);
 router.post('/refresh', validate(refreshSchema), refresh);
 router.post('/register', authLimiter, validate(registerOrganizationSchema), registerOrganization);
+router.post('/forgot-password', authLimiter, validate(forgotPasswordSchema), forgotPassword);
+router.post('/reset-password', authLimiter, validate(resetPasswordSchema), resetPassword);
 
 router.get('/me', authenticate, me);
 router.patch('/me', authenticate, validate(updateProfileSchema), updateProfile);
 router.post('/change-password', authenticate, validate(changePasswordSchema), changePassword);
+
+// المصادقة الثنائية (إدارة الحساب الشخصي)
+router.get('/2fa/status', authenticate, twoFactorStatus);
+router.post('/2fa/setup', authenticate, beginTwoFactorSetup);
+router.post('/2fa/enable', authenticate, validate(twoFactorCodeSchema), enableTwoFactor);
+router.post('/2fa/disable', authenticate, validate(disableTwoFactorSchema), disableTwoFactor);
+router.post('/2fa/recovery-codes', authenticate, validate(regenerateRecoveryCodesSchema), regenerateRecoveryCodes);
 
 // إدارة المستخدمين
 router.get('/users', requirePermission('user:read'), listUsers);
 router.get('/users/:id', requirePermission('user:read'), getUser);
 router.post('/users', requirePermission('user:manage'), validate(createUserSchema), createUser);
 router.patch('/users/:id', requirePermission('user:manage'), validate(updateUserSchema), updateUser);
+router.post('/users/:id/2fa/reset', requirePermission('user:manage'), resetUserTwoFactor);
 router.delete('/users/:id', requirePermission('user:manage'), deactivateUser);
 
 // كتالوج الأدوار والصلاحيات

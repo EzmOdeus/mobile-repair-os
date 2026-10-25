@@ -18,7 +18,10 @@ const paymentSchema = new Schema(
     invoiceId: { type: Schema.Types.ObjectId, ref: 'Invoice', default: null, index: true },
     ticketId: { type: Schema.Types.ObjectId, ref: 'RepairTicket', default: null, index: true },
     customerId: { type: Schema.Types.ObjectId, ref: 'Customer', default: null, index: true },
-    supplierId: { type: Schema.Types.ObjectId, ref: 'Supplier', default: null },
+    supplierId: { type: Schema.Types.ObjectId, ref: 'Supplier', default: null, index: true },
+    purchaseOrderId: { type: Schema.Types.ObjectId, ref: 'PurchaseOrder', default: null, index: true },
+    /** الوردية المفتوحة للفرع وقت التسجيل — أساس حساب درج النقد */
+    shiftId: { type: Schema.Types.ObjectId, ref: 'Shift', default: null, index: true },
 
     /** بيانات التحويل الإلكتروني */
     reference: { type: String, default: '' },
@@ -43,6 +46,7 @@ paymentSchema.index({ organizationId: 1, receiptNumber: 1 }, { unique: true });
 paymentSchema.index({ organizationId: 1, paidAt: -1, method: 1 });
 paymentSchema.index({ organizationId: 1, branchId: 1, paidAt: -1 });
 paymentSchema.index({ organizationId: 1, recordedBy: 1, paidAt: -1 });
+paymentSchema.index({ organizationId: 1, shiftId: 1, paidAt: -1 });
 
 export type Payment = InferSchemaType<typeof paymentSchema>;
 export type PaymentDoc = HydratedDocument<Payment>;

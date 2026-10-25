@@ -45,7 +45,7 @@ export const corsOptions: CorsOptions = {
   credentials: true,
   exposedHeaders: ['x-request-id'],
   /** نسمح برؤوس الترويسة الشائعة حتى لا يفشل طلب preflight */
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-access-token', 'x-request-id'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-access-token', 'x-request-id', 'x-branch-id'],
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   maxAge: 86_400,
 };

@@ -74,6 +74,20 @@ Mongoose Queries **كسولة (lazy)**: تنفيذها يحدث في microtask �
 - في الـmiddleware نستخدم `enterWith` (متزامن) حتى يستمر السياق عبر بقية الطلب.
 - `populate` **لا يحمل مرشّح المؤسسة** في استعلاماته الداخلية، فيرفضه العزل. لذلك كل الكيانات المرتبطة تُقرأ باستعلامات صريحة النطاق (`{ _id, organizationId }`) ثم تُربط في الذاكرة.
 
+### عزل الفروع (Branch Scoping)
+
+عزل المؤسسة لا يكفي في مركز متعدد الفروع؛ لذلك تُطبَّق طبقة ثانية:
+
+1. **مبدّل الفرع النشط** في الواجهة يكتب `x-branch-id` في كل طلب عبر `api` client، ويُطلق `mutate(() => true)` لإعادة تحميل كل بيانات SWR.
+2. **`branchFilter(req)`** يعيد: فرع التوكن إذا كان المستخدم مقيّدًا بفرع، أو فرع الطلب إن أرسله مالك/مدير/محاسب/مشاهد، أو `null` = كل الفروع.
+3. **`requireBranchAccess(req, branchId)`** يُستدعى بعد تحميل أي مستند (تذكرة، عرض، فحص، ضمان، أمر شراء، تحويل…) لمنع الوصول العرضي عبر معرّف من فرع آخر.
+4. **المخزون**: قراءة `Part.stock` كإجمالي مؤسسة ممنوعة عند وجود فرع نشط؛ تُقرأ الكميات من `InventoryItem` للفرع، وكذلك `/parts` و`/parts/low-stock` ولوحة التحكم.
+5. **نقاط البيع** ترفض التسجيل بدون فرع محدد (لا يوجد «بيع افتراضي» على الفرع الأول).
+6. **CORS**: يجب أن يسمح `Access-Control-Allow-Headers` بالرأس `x-branch-id`، وإلا يفشل preflight في المتصفح رغم نجاح الطلبات من curl/الاختبارات. هذا مُصلَح وموثّق هنا لتجنّب تكراره.
+7. **اختيار الفني**: `/technicians/available` يقصر القائمة على الفنيين الأعضاء في الفرع النشط (`branchIds`)، لكن عدّ المهام النشطة يبقى **عالميًا عبر كل الفروع** لأن سقف `maxActiveJobs` شخصي ويُفرض كذلك في `assignTechnician`؛ لو حُسب الحمل للفرع وحده لعرضت الشاشة مقاعد متاحة يرفضها الـAPI.
+
+> ملاحظة تصميم: `Part` يحمل `branchId` لمنشئ القطعة، لكن القطعة نفسها قابلة للاستخدام في كل الفروع عبر `InventoryItem`؛ لذلك لا تُفلتر القطع بـ`branchId` عند القراءة، بل تُفلتر **الكميات** فقط.
+
 ---
 
 ## 3. دورة عمل الصيانة (Workflow Engine)
@@ -87,7 +101,7 @@ Received → Intake → Inspection → Diagnosis → Estimate → Waiting Approv
 
 مع مسارات جانبية: `Cancelled`, `Unrepairable`.
 
-### ضمانات مُختبَرة (70/70 اختبار E2E)
+### ضمانات مُختبَرة (69/69 اختبار E2E)
 
 | القاعدة | أين تُفرض | الاختبار |
 |---|---|---|
@@ -109,12 +123,12 @@ Received → Intake → Inspection → Diagnosis → Estimate → Waiting Approv
 
 ---
 
-## 4. نموذج البيانات (27 مجموعة)
+## 4. نموذج البيانات (28 مجموعة)
 
 ```
 المؤسسة والوصول
   organizations ─ branches ─ users
-                                        └ (RBAC: 7 أدوار × 54 صلاحية)
+                                        └ (RBAC: 8 أدوار × 68 صلاحية)
 
 العميل والجهاز
   customers ─ devices ─ storedfiles
@@ -133,7 +147,7 @@ Received → Intake → Inspection → Diagnosis → Estimate → Waiting Approv
                  └─ warrantyclaims (مرتبطة بالتذكرة الأصلية والقطعة والفني)
 
 المال والتشغيل
-  expenses · notifications · auditlogs · knowledgearticles · stocktransfers
+  expenses · shifts · notifications · auditlogs · knowledgearticles · stocktransfers
 ```
 
 ### قرارات تصميم مهمة
@@ -157,7 +171,7 @@ Received → Intake → Inspection → Diagnosis → Estimate → Waiting Approv
 |---|---|
 | النقل | CORS مُقيَّد بقائمة أصول، Helmet، ضغط |
 | المصادقة | JWT منفصلان (Access/Refresh)، bcrypt 12 دورة، `select: false` لكلمة المرور |
-| الصلاحيات | 54 صلاحية تُفحص على المسار + دعم صلاحيات إضافية/محجوبة لكل مستخدم |
+| الصلاحيات | 68 صلاحية تُفحص على المسار + دعم صلاحيات إضافية/محجوبة لكل مستخدم |
 | عزل البيانات | `tenantPlugin` على كل الموديلات |
 | سجل التدقيق | تلقائي لكل كتابة + تدقيق على المورد مع IP و requestId |
 | تحديد المعدل | 600/15د عام، 30/15د على المصادقة |

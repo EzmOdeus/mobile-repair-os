@@ -1,19 +1,10 @@
-import fs from 'node:fs';
-import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { env } from '../config/env.js';
 import { StoredFileModel } from '../models/StoredFile.js';
 import { ApiError } from '../utils/ApiError.js';
 import { getTenantContext } from '../context/tenantContext.js';
-import { logger } from '../config/logger.js';
-
-/** المجلد المطلق لتخزين الملفات */
-export function resolveUploadDir(): string {
-  return path.isAbsolute(env.UPLOAD_DIR)
-    ? env.UPLOAD_DIR
-    : path.resolve(process.cwd(), env.UPLOAD_DIR);
-}
+import { getStorageDriver } from './storageDrivers.js';
 
 const ALLOWED_MIME = new Set([
   'image/jpeg',
@@ -101,9 +92,7 @@ export async function saveFile(input: SaveFileInput) {
     mimeType: input.mimeType,
   });
 
-  const absolute = path.join(resolveUploadDir(), storageKey);
-  await fsp.mkdir(path.dirname(absolute), { recursive: true });
-  await fsp.writeFile(absolute, input.buffer);
+  await getStorageDriver().put(storageKey, input.buffer, input.mimeType);
 
   const checksum = createHash('sha256').update(input.buffer).digest('hex');
 
@@ -137,20 +126,14 @@ export async function softDeleteFile(fileId: string): Promise<void> {
   await file.save();
 }
 
-/** حذف فعلي من القرص (يُستخدم عند الحاجة القصوى فقط) */
+/** حذف فعلي من مخزن الملفات (يُستخدم عند الحاجة القصوى فقط) */
 export async function hardDeleteFile(storageKey: string): Promise<void> {
-  try {
-    await fsp.unlink(path.join(resolveUploadDir(), storageKey));
-  } catch (err) {
-    logger.warn({ err, storageKey }, 'تعذر حذف الملف من القرص');
-  }
+  await getStorageDriver().delete(storageKey);
 }
 
 /** قراءة ملف للتحقق من الأذونات قبل التقديم */
-export async function readFileStream(storageKey: string): Promise<fs.ReadStream> {
-  const absolute = path.join(resolveUploadDir(), storageKey);
-  if (!fs.existsSync(absolute)) throw ApiError.notFound('الملف غير موجود على القرص');
-  return fs.createReadStream(absolute);
+export async function readFileStream(storageKey: string): Promise<NodeJS.ReadableStream> {
+  return getStorageDriver().getStream(storageKey);
 }
 
 /**

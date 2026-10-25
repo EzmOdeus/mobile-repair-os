@@ -154,6 +154,8 @@ const repairTicketSchema = new Schema(
     organizationId: { type: Schema.Types.ObjectId, ref: 'Organization', required: true, index: true, immutable: true },
     branchId: { type: Schema.Types.ObjectId, ref: 'Branch', default: null, index: true },
     ticketNumber: { type: String, required: true, trim: true },
+    /** مفتاح idempotency يرسله العميل حتى لا تتكرر التذكرة عند إعادة المحاولة */
+    clientRequestId: { type: String, default: null, trim: true },
     /** رمز عام للتتبع من بوابة العميل بدون تسجيل دخول */
     trackingToken: { type: String, required: true, unique: true, index: true },
     customerId: { type: Schema.Types.ObjectId, ref: 'Customer', required: true, index: true },
@@ -200,6 +202,10 @@ const repairTicketSchema = new Schema(
 repairTicketSchema.plugin(tenantPlugin);
 
 repairTicketSchema.index({ organizationId: 1, ticketNumber: 1 }, { unique: true });
+repairTicketSchema.index(
+  { organizationId: 1, clientRequestId: 1 },
+  { unique: true, partialFilterExpression: { clientRequestId: { $type: 'string' } } },
+);
 repairTicketSchema.index({ organizationId: 1, status: 1, priority: -1, createdAt: -1 });
 repairTicketSchema.index({ organizationId: 1, assignedTechnicianId: 1, status: 1 });
 repairTicketSchema.index({ organizationId: 1, customerId: 1, createdAt: -1 });

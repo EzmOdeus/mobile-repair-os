@@ -6,12 +6,14 @@ import { EstimateModel } from '../models/Estimate.js';
 import { PaymentModel } from '../models/Payment.js';
 import { WarrantyClaimModel } from '../models/WarrantyClaim.js';
 import { StockTransferModel } from '../models/StockTransfer.js';
+import { PurchaseOrderModel } from '../models/PurchaseOrder.js';
+import { StockCountModel } from '../models/StockCount.js';
 import { ApiError } from '../utils/ApiError.js';
 import { getTenantContext, runAsSystem } from '../context/tenantContext.js';
 import { formatSequenceNumber, publicToken } from '../utils/ids.js';
 
 /** أنواع المستندات التي تحتاج ترقيمًا متسلسلًا */
-export type SequenceKind = 'REP' | 'INV' | 'TRF' | 'EST' | 'RCP' | 'WCL' | 'QT';
+export type SequenceKind = 'REP' | 'INV' | 'TRF' | 'EST' | 'RCP' | 'WCL' | 'QT' | 'PO' | 'STK' | 'SFT';
 
 /**
  * الفرع الذي يحمل عدّاد الترقيم المشترك.
@@ -129,6 +131,18 @@ export async function nextClaimNumber(): Promise<string> {
   return nextSequenceNumber('WCL');
 }
 
+export async function nextPurchaseOrderNumber(): Promise<string> {
+  return nextSequenceNumber('PO');
+}
+
+export async function nextStockCountNumber(): Promise<string> {
+  return nextSequenceNumber('STK');
+}
+
+export async function nextShiftNumber(): Promise<string> {
+  return nextSequenceNumber('SFT');
+}
+
 /**
  * مزامنة عدّادات الترقيم مع الأرقام الفعلية في قاعدة البيانات — لكل مؤسسة على حدة.
  *
@@ -179,17 +193,20 @@ export async function syncNumberCounters(
     return byOrg;
   };
 
-  const [tickets, invoices, estimates, payments, claims, transfers, branches] = await runAsSystem(async () =>
-    Promise.all([
-      RepairTicketModel.find({}).select('ticketNumber organizationId').lean(),
-      InvoiceModel.find({}).select('invoiceNumber organizationId').lean(),
-      EstimateModel.find({}).select('estimateNumber organizationId').lean(),
-      PaymentModel.find({}).select('receiptNumber organizationId').lean(),
-      WarrantyClaimModel.find({}).select('claimNumber organizationId').lean(),
-      StockTransferModel.find({}).select('transferNumber organizationId').lean(),
-      BranchModel.find({}).select('counterSeq organizationId').lean(),
-    ]),
-  );
+  const [tickets, invoices, estimates, payments, claims, transfers, purchaseOrders, stockCounts, branches] =
+    await runAsSystem(async () =>
+      Promise.all([
+        RepairTicketModel.find({}).select('ticketNumber organizationId').lean(),
+        InvoiceModel.find({}).select('invoiceNumber organizationId').lean(),
+        EstimateModel.find({}).select('estimateNumber organizationId').lean(),
+        PaymentModel.find({}).select('receiptNumber organizationId').lean(),
+        WarrantyClaimModel.find({}).select('claimNumber organizationId').lean(),
+        StockTransferModel.find({}).select('transferNumber organizationId').lean(),
+        PurchaseOrderModel.find({}).select('poNumber organizationId').lean(),
+        StockCountModel.find({}).select('countNumber organizationId').lean(),
+        BranchModel.find({}).select('counterSeq organizationId').lean(),
+      ]),
+    );
 
   const merged = new Map<string, Map<string, number>>();
   const mergeOrg = (orgId: string, counters: Map<string, number>): void => {
@@ -209,6 +226,8 @@ export async function syncNumberCounters(
   for (const [orgId, counters] of collectMax(payments, 'receiptNumber')) mergeOrg(orgId, counters);
   for (const [orgId, counters] of collectMax(claims, 'claimNumber')) mergeOrg(orgId, counters);
   for (const [orgId, counters] of collectMax(transfers, 'transferNumber')) mergeOrg(orgId, counters);
+  for (const [orgId, counters] of collectMax(purchaseOrders, 'poNumber')) mergeOrg(orgId, counters);
+  for (const [orgId, counters] of collectMax(stockCounts, 'countNumber')) mergeOrg(orgId, counters);
 
   // العدّادات القائمة تُدمج كما هي (Math.max) حتى لا ينقص أي عدّاد مهما حُذفت مستندات
   for (const branch of branches) {

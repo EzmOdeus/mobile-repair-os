@@ -6,7 +6,7 @@
  * والصلاحيات تُفحص على مستوى المسار (route) قبل الوصول للموديل.
  */
 
-export const ROLES = ['owner', 'admin', 'manager', 'receptionist', 'technician', 'accountant', 'viewer'] as const;
+export const ROLES = ['owner', 'admin', 'manager', 'receptionist', 'technician', 'accountant', 'viewer', 'platform'] as const;
 export type Role = (typeof ROLES)[number];
 
 export const ROLE_LABELS_AR: Record<Role, string> = {
@@ -17,6 +17,7 @@ export const ROLE_LABELS_AR: Record<Role, string> = {
   technician: 'فني',
   accountant: 'محاسب',
   viewer: 'مشاهدة فقط',
+  platform: 'مدير المنصة',
 };
 
 export const PERMISSIONS = [
@@ -70,6 +71,11 @@ export const PERMISSIONS = [
   'stock:move',
   'supplier:read',
   'supplier:manage',
+  // المشتريات وسداد الموردين
+  'purchase:read',
+  'purchase:manage',
+  'purchase:receive',
+  'supplier_payment:record',
   // الفواتير والمدفوعات
   'invoice:read',
   'invoice:write',
@@ -77,6 +83,9 @@ export const PERMISSIONS = [
   'payment:record',
   'expense:read',
   'expense:manage',
+  // الخزينة والورديات
+  'shift:read',
+  'shift:manage',
   // الضمان
   'warranty:read',
   'warranty:manage',
@@ -93,11 +102,31 @@ export const PERMISSIONS = [
   // قاعدة المعرفة
   'knowledge:read',
   'knowledge:write',
+  // ماركت بلس: نشر إعلانات وإدارة عروض داخل المركز
+  'market:read',
+  'market:manage',
+  // إدارة المنصة (فقط لدور platform — لا تُمنح لأي دور مركزي)
+  'platform:orgs:read',
+  'platform:orgs:manage',
+  'platform:stats:read',
+  'market:moderate',
+  'market:prices:manage',
 ] as const;
 
 export type Permission = (typeof PERMISSIONS)[number];
 
 const ALL: Permission[] = [...PERMISSIONS];
+
+/** صلاحيات المنصة: تُمنح لدور platform فقط ولا تصل لأي دور داخل المركز */
+export const PLATFORM_ONLY: Permission[] = [
+  'platform:orgs:read',
+  'platform:orgs:manage',
+  'platform:stats:read',
+  'market:moderate',
+  'market:prices:manage',
+];
+/** كل صلاحيات المركز (بدون صلاحيات المنصة) — أساس أدوار المالك والمدير */
+const ORG_ALL: Permission[] = ALL.filter((p) => !PLATFORM_ONLY.includes(p));
 
 /** محلل الاستقبال: دورة الاستلام والتسليم والتحصيل */
 const RECEPTIONIST: Permission[] = [
@@ -129,12 +158,16 @@ const RECEPTIONIST: Permission[] = [
   'invoice:write',
   'payment:read',
   'payment:record',
+  'shift:read',
+  'shift:manage',
   'warranty:read',
   'pos:operate',
   'notification:read',
   'notification:send',
   'report:read',
   'knowledge:read',
+  'market:read',
+  'market:manage',
 ];
 
 /** الفني: قائمة أعماله، التشخيص، القطع، الفحص */
@@ -181,28 +214,33 @@ const ACCOUNTANT: Permission[] = [
   'stock:read',
   'supplier:read',
   'supplier:manage',
+  'purchase:read',
+  'supplier_payment:record',
   'invoice:read',
   'invoice:write',
   'payment:read',
   'payment:record',
   'expense:read',
   'expense:manage',
+  'shift:read',
+  'shift:manage',
   'report:read',
   'analytics:read',
   'audit:read',
   'pos:operate',
   'warranty:read',
   'notification:read',
+  'market:read',
 ];
 
 /** مدير الفرع: كل شيء داخل الفرع ما عدا إدارة المؤسسة والمستخدمين */
-const MANAGER: Permission[] = ALL.filter(
+const MANAGER: Permission[] = ORG_ALL.filter(
   (p) => !['org:update', 'branch:manage', 'user:manage'].includes(p),
 );
 
 export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
-  owner: ALL,
-  admin: ALL,
+  owner: ORG_ALL,
+  admin: ORG_ALL,
   manager: MANAGER,
   receptionist: RECEPTIONIST,
   technician: TECHNICIAN,
@@ -220,15 +258,29 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
     'estimate:read',
     'part:read',
     'stock:read',
+    'purchase:read',
     'invoice:read',
     'payment:read',
+    'shift:read',
     'warranty:read',
     'report:read',
     'analytics:read',
     'knowledge:read',
     'notification:read',
+    'market:read',
   ],
+  platform: PLATFORM_ONLY,
 };
+
+/** الأدوار التي يمكن لمالك مركز إنشاؤها — دور المنصة مستثنى عمدًا */
+export const CENTER_ASSIGNABLE_ROLES = ROLES.filter((r) => r !== 'platform');
+
+/**
+ * الصلاحيات التي يمكن منحها/حجبها بشكل فردي لمستخدم مركز (extraPermissions).
+ * صلاحيات المنصة مستبعدة هنا وفي الـvalidators — وإلا أمكن لمالك مركز
+ * أن يمنح نفسه `platform:orgs:manage` عبر التخصيص ويدير مراكز أخرى.
+ */
+export const CENTER_ASSIGNABLE_PERMISSIONS: Permission[] = ALL.filter((p) => !PLATFORM_ONLY.includes(p));
 
 export function permissionsForRole(role: Role): Permission[] {
   return ROLE_PERMISSIONS[role] ?? [];

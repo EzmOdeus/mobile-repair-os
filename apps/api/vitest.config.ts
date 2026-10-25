@@ -13,6 +13,11 @@ export default defineConfig({
     include: ['src/**/*.test.ts'],
     testTimeout: 20_000,
     hookTimeout: 30_000,
+    /**
+     * كل ملفات الاختبار تتشارك قاعدة الاختبار نفسها وتُسقطها في beforeEach،
+     * فتشغيلها بالتوازي يسبب تداخلًا (عدّادات/مستندات تختفي أثناء اختبار آخر).
+     */
+    fileParallelism: false,
   },
   resolve: {
     // مشروع NodeNext: الاستيرادات تستخدم امتداد .js وهي تشير إلى ملفات .ts

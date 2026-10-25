@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { ArrowRight, Lock, ShieldAlert } from 'lucide-react';
-import { useAuth } from '@/lib/auth';
+import { ROLE_LABELS_AR, useAuth } from '@/lib/auth';
 import { PROTECTED_ROUTES, canAccessRoute, homePathForRole, permissionForPath } from '@/lib/routePermissions';
 
 /**
@@ -57,7 +57,8 @@ function AccessDenied({ routeLabel, requiredPermission }: { routeLabel: string; 
 
       <h1 className="mt-4 text-xl font-bold text-ink-900">لا تملك صلاحية الوصول</h1>
       <p className="mt-2 text-sm leading-relaxed text-ink-500">
-        دورك الحالي <span className="font-bold text-ink-700">({user?.role ?? '—'})</span> لا يمنحك الوصول إلى{' '}
+        دورك الحالي{' '}
+        <span className="font-bold text-ink-700">({user?.role ? ROLE_LABELS_AR[user.role] : '—'})</span> لا يمنحك الوصول إلى{' '}
         <span className="font-bold text-ink-700">{routeLabel}</span>.
         <br />
         لو كنت تحتاج هذه الصفحة، اطلب من مالك المركز منحك صلاحية{' '}

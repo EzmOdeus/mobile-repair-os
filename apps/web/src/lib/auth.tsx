@@ -1,11 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { mutate } from 'swr';
 
 const ACCESS_KEY = 'mros.accessToken';
 const REFRESH_KEY = 'mros.refreshToken';
 const USER_KEY = 'mros.user';
 const ORG_KEY = 'mros.organization';
+const BRANCH_KEY = 'mros.activeBranchId';
 
 export interface SessionUser {
   id: string;
@@ -23,9 +25,22 @@ export interface SessionUser {
     maxActiveJobs?: number;
     workbench?: string;
   } | null;
+  twoFactorEnabled?: boolean;
+  twoFactorEnabledAt?: string | null;
 }
 
-export type Role = 'owner' | 'admin' | 'manager' | 'receptionist' | 'technician' | 'accountant' | 'viewer';
+export type LoginResult =
+  | { twoFactorRequired: true; challengeToken: string; expiresIn: number }
+  | { twoFactorRequired: false };
+
+interface SessionPayload {
+  accessToken: string;
+  refreshToken: string;
+  user: SessionUser;
+  organization: SessionOrganization;
+}
+
+export type Role = 'owner' | 'admin' | 'manager' | 'receptionist' | 'technician' | 'accountant' | 'viewer' | 'platform';
 
 export interface SessionOrganization {
   id: string;
@@ -50,10 +65,18 @@ export const ROLE_LABELS_AR: Record<Role, string> = {
   technician: 'فني',
   accountant: 'محاسب',
   viewer: 'مشاهدة فقط',
+  platform: 'مدير المنصة',
 };
 
 export function getApiUrl(): string {
-  return process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
+  // على Vercel (خدمة web + api في مشروع واحد) نستخدم مسارًا نسبيًا عبر rewrites.
+  // محليًا نوجّه لخادم الـAPI على 4000، وأي NEXT_PUBLIC_API_URL مضبوط يتقدّم دائمًا.
+  const configured = process.env.NEXT_PUBLIC_API_URL;
+  if (configured) return configured;
+  if (typeof window !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)) {
+    return 'http://localhost:4000/api/v1';
+  }
+  return '/api/v1';
 }
 
 export function getAccessToken(): string | null {
@@ -78,6 +101,18 @@ export function clearSession(): void {
   window.localStorage.removeItem(REFRESH_KEY);
   window.localStorage.removeItem(USER_KEY);
   window.localStorage.removeItem(ORG_KEY);
+  window.localStorage.removeItem(BRANCH_KEY);
+}
+
+export function getActiveBranchId(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.localStorage.getItem(BRANCH_KEY);
+}
+
+export function setActiveBranchId(branchId: string | null): void {
+  if (typeof window === 'undefined') return;
+  if (branchId) window.localStorage.setItem(BRANCH_KEY, branchId);
+  else window.localStorage.removeItem(BRANCH_KEY);
 }
 
 export function getStoredUser(): SessionUser | null {
@@ -135,9 +170,16 @@ interface AuthContextValue {
   user: SessionUser | null;
   organization: SessionOrganization | null;
   branches: SessionBranch[];
+  /** الفروع التي يمكن للمستخدم العمل فيها حسب دوره */
+  availableBranches: SessionBranch[];
+  /** الفرع النشط؛ null = كل الفروع (للمالك/الإدارة فقط) */
+  activeBranchId: string | null;
+  setActiveBranch: (branchId: string | null) => void;
   isLoading: boolean;
   isAuthenticated: boolean;
-  login: (identifier: string, password: string, organizationSlug?: string) => Promise<void>;
+  login: (identifier: string, password: string, organizationSlug?: string) => Promise<LoginResult>;
+  /** إتمام الدخول بعد رمز TOTP أو رمز استرداد عند تفعيل التحقق بخطوتين */
+  verifyTwoFactor: (challengeToken: string, code: string) => Promise<void>;
   /** إنشاء مركز جديد: يُنشئ المؤسسة + الفرع الرئيسي + حساب المالك ويسجّل الدخول فورًا */
   registerOrganization: (payload: RegisterOrganizationPayload) => Promise<{ slug: string; organizationName: string }>;
   logout: () => void;
@@ -154,6 +196,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [organization, setOrganization] = useState<SessionOrganization | null>(null);
   const [branches, setBranches] = useState<SessionBranch[]>([]);
+  const [activeBranchId, setActiveBranchState] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   const refreshProfile = useCallback(async () => {
@@ -164,7 +207,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setIsLoading(false);
       return;
     }
-
     try {
       let response = await fetch(`${getApiUrl()}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -203,8 +245,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       };
       setUser(payload.data.user);
       setOrganization(payload.data.organization);
-      setBranches(payload.data.branches ?? []);
+      const loadedBranches = payload.data.branches ?? [];
+      setBranches(loadedBranches);
       if (payload.data.organization) storeSession(payload.data.user, payload.data.organization);
+
+      /**
+       * ضبط الفرع النشط:
+       * - الأدوار المركزية (مالك/مدير نظام/محاسب/مشاهدة) تبدأ على «كل الفروع».
+       * - الأدوار التشغيلية تُقيَّد بأول فرع مسند لها، ولا ترى غير فروعها.
+       */
+      const storedBranch = getActiveBranchId();
+      const assigned = payload.data.user.branchIds ?? [];
+      const orgWide = ['owner', 'admin', 'accountant', 'viewer'].includes(payload.data.user.role);
+      const known = new Set(loadedBranches.map((b) => b.id));
+      let nextActive: string | null = null;
+      if (storedBranch && known.has(storedBranch) && (orgWide || assigned.includes(storedBranch))) {
+        nextActive = storedBranch;
+      } else if (!orgWide) {
+        nextActive = assigned.find((id) => known.has(id)) ?? loadedBranches[0]?.id ?? null;
+      }
+      setActiveBranchId(nextActive);
+      setActiveBranchState(nextActive);
     } catch {
       clearSession();
       setUser(null);
@@ -223,8 +284,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     void refreshProfile();
   }, [refreshProfile]);
 
+  /** حفظ جلسة كاملة بعد الدخول العادي أو بعد التحقق بخطوتين. */
+  const applySession = useCallback(
+    async (data: SessionPayload) => {
+      setTokens(data.accessToken, data.refreshToken);
+      storeSession(data.user, data.organization);
+      setUser(data.user);
+      setOrganization(data.organization);
+      await refreshProfile();
+    },
+    [refreshProfile],
+  );
+
   const login = useCallback(
-    async (identifier: string, password: string, organizationSlug?: string) => {
+    async (identifier: string, password: string, organizationSlug?: string): Promise<LoginResult> => {
       const response = await fetch(`${getApiUrl()}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -233,12 +306,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const payload = (await response.json()) as {
         success: boolean;
-        data?: {
-          accessToken: string;
-          refreshToken: string;
-          user: SessionUser;
-          organization: SessionOrganization;
-        };
+        data?: SessionPayload | { twoFactorRequired: true; challengeToken: string; expiresIn: number };
         error?: { message: string; code: string; details?: unknown };
       };
 
@@ -246,13 +314,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw new Error(payload.error?.message ?? 'تعذر تسجيل الدخول');
       }
 
-      setTokens(payload.data.accessToken, payload.data.refreshToken);
-      storeSession(payload.data.user, payload.data.organization);
-      setUser(payload.data.user);
-      setOrganization(payload.data.organization);
-      await refreshProfile();
+      if ('twoFactorRequired' in payload.data && payload.data.twoFactorRequired) {
+        return {
+          twoFactorRequired: true,
+          challengeToken: payload.data.challengeToken,
+          expiresIn: payload.data.expiresIn,
+        };
+      }
+
+      await applySession(payload.data as SessionPayload);
+      return { twoFactorRequired: false };
     },
-    [refreshProfile],
+    [applySession],
+  );
+
+  const verifyTwoFactor = useCallback(
+    async (challengeToken: string, code: string) => {
+      const response = await fetch(`${getApiUrl()}/auth/2fa/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeToken, code }),
+      });
+
+      const payload = (await response.json()) as {
+        success: boolean;
+        data?: SessionPayload;
+        error?: { message: string; code: string; details?: unknown };
+      };
+
+      if (!response.ok || !payload.success || !payload.data) {
+        throw new Error(payload.error?.message ?? 'رمز التحقق غير صحيح');
+      }
+
+      await applySession(payload.data);
+    },
+    [applySession],
   );
 
   /**
@@ -311,7 +407,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null);
     setOrganization(null);
     setBranches([]);
+    setActiveBranchState(null);
   }, []);
+
+  const setActiveBranch = useCallback((branchId: string | null) => {
+    setActiveBranchId(branchId);
+    setActiveBranchState(branchId);
+    // كل القوائم والتقارير مرتبطة بالفرع — نعيد جلبها فور التبديل
+    void mutate(() => true);
+  }, []);
+
+  const availableBranches = useMemo(() => {
+    if (!user) return branches;
+    if (['owner', 'admin', 'accountant', 'viewer'].includes(user.role)) return branches;
+    const assigned = new Set(user.branchIds ?? []);
+    return branches.filter((b) => assigned.has(b.id));
+  }, [branches, user]);
 
   const hasPermission = useCallback(
     (permission: string) => {
@@ -335,9 +446,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       organization,
       branches,
+      availableBranches,
+      activeBranchId,
+      setActiveBranch,
       isLoading,
       isAuthenticated: Boolean(user),
       login,
+      verifyTwoFactor,
       registerOrganization,
       logout,
       refreshProfile,
@@ -348,8 +463,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       organization,
       branches,
+      availableBranches,
+      activeBranchId,
+      setActiveBranch,
       isLoading,
       login,
+      verifyTwoFactor,
       registerOrganization,
       logout,
       refreshProfile,

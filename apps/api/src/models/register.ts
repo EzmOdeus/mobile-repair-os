@@ -18,6 +18,8 @@ import { InventoryItemModel } from './InventoryItem.js';
 import { StockMovementModel } from './StockMovement.js';
 import { StockBatchModel } from './StockBatch.js';
 import { StockTransferModel } from './StockTransfer.js';
+import { PurchaseOrderModel } from './PurchaseOrder.js';
+import { StockCountModel } from './StockCount.js';
 import { RepairPartModel } from './RepairPart.js';
 import { RepairLaborModel } from './RepairLabor.js';
 import { EstimateModel } from './Estimate.js';
@@ -27,9 +29,13 @@ import { WarrantyClaimModel } from './WarrantyClaim.js';
 import { InvoiceModel } from './Invoice.js';
 import { PaymentModel } from './Payment.js';
 import { ExpenseModel } from './Expense.js';
+import { ShiftModel } from './Shift.js';
 import { NotificationModel } from './Notification.js';
 import { AuditLogModel } from './AuditLog.js';
 import { KnowledgeArticleModel } from './KnowledgeArticle.js';
+import { MarketListingModel } from './MarketListing.js';
+import { MarketOfferModel } from './MarketOffer.js';
+import { PhonePriceGuideModel } from './PhonePriceGuide.js';
 
 const MODELS = [
   OrganizationModel,
@@ -47,6 +53,8 @@ const MODELS = [
   StockMovementModel,
   StockBatchModel,
   StockTransferModel,
+  PurchaseOrderModel,
+  StockCountModel,
   RepairPartModel,
   RepairLaborModel,
   EstimateModel,
@@ -56,9 +64,13 @@ const MODELS = [
   InvoiceModel,
   PaymentModel,
   ExpenseModel,
+  ShiftModel,
   NotificationModel,
   AuditLogModel,
   KnowledgeArticleModel,
+  MarketListingModel,
+  MarketOfferModel,
+  PhonePriceGuideModel,
 ] as const;
 
 export function registerAllModels(): string[] {

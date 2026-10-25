@@ -1,6 +1,11 @@
 import { Schema, model, type InferSchemaType, type HydratedDocument } from 'mongoose';
 
-export const SUBSCRIPTION_PLANS = ['free', 'starter', 'pro', 'business', 'enterprise'] as const;
+/**
+ * القيم القديمة (free/business) تبقى مقبولة قراءةً حتى لا يفشل حفظ مؤسسات قائمة
+ * كُتبت بها قبل توحيد الكتالوج؛ الكتالوج في constants/plans.ts يعيد توجيهها
+ * (free→trial, business→pro).
+ */
+export const SUBSCRIPTION_PLANS = ['free', 'trial', 'starter', 'growth', 'pro', 'business', 'enterprise'] as const;
 export type SubscriptionPlan = (typeof SUBSCRIPTION_PLANS)[number];
 
 const settingsSchema = new Schema(
@@ -30,7 +35,12 @@ const subscriptionSchema = new Schema(
     plan: { type: String, enum: SUBSCRIPTION_PLANS, default: 'free' },
     status: { type: String, enum: ['trialing', 'active', 'past_due', 'cancelled'], default: 'trialing' },
     startedAt: { type: Date, default: Date.now },
+    /** نهاية فترة التغطية المدفوعة/التجريبية — لا تُعدّل عند دخول مهلة السداد */
     expiresAt: { type: Date, default: null },
+    /** نهاية مهلة السداد بعد انتهاء التغطية (تُضبط مرة واحدة عند الانتقال إلى past_due) */
+    graceEndsAt: { type: Date, default: null },
+    /** مفاتيح تذكيرات الانتهاء المرسلة بصيغة `${thresholdDays}:${expiresAtISO}` لمنع التكرار */
+    reminderKeys: { type: [String], default: [] },
     maxUsers: { type: Number, default: 2 },
     maxBranches: { type: Number, default: 1 },
     monthlyTicketLimit: { type: Number, default: 50 },

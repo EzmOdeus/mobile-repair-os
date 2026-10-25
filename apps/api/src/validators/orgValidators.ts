@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { objectIdSchema, trimmedString } from './common.js';
+import { PLATFORM_PLAN_KEYS, SELF_SERVICE_PLAN_KEYS } from '../constants/plans.js';
+import { SUBSCRIPTION_PAYMENT_METHODS } from '../models/SubscriptionPayment.js';
 
 /* --------------------------- المؤسسة والفروع --------------------------- */
 
@@ -248,6 +250,25 @@ export const transferStockSchema = z.object({
   reason: z.string().trim().max(300).optional().default(''),
 });
 
+export const stockCountSchema = z
+  .object({
+    branchId: objectIdSchema.optional(),
+    lines: z
+      .array(
+        z.object({
+          partId: objectIdSchema,
+          countedOnHand: z.coerce.number().min(0),
+          note: z.string().trim().max(300).optional().default(''),
+        }),
+      )
+      .min(1, 'أضف قطعة واحدة على الأقل'),
+    notes: z.string().trim().max(2000).optional().default(''),
+  })
+  .refine(
+    (v) => new Set(v.lines.map((l) => l.partId)).size === v.lines.length,
+    { message: 'القطعة مكررة في محضر الجرد', path: ['lines'] },
+  );
+
 /* ---------------------------- قطع ومصنعية ---------------------------- */
 
 export const addRepairPartSchema = z.object({
@@ -279,4 +300,63 @@ export const addLaborSchema = z.object({
   technicianId: objectIdSchema.nullable().optional(),
   isWarrantyWork: z.boolean().optional().default(false),
   notes: z.string().trim().max(500).optional().default(''),
+});
+
+/* --------------------------- الاشتراك والباقات --------------------------- */
+
+const monthsSchema = z.coerce.number().int().min(1).max(36);
+const priceSchema = z.coerce.number().min(0).max(1_000_000);
+const paymentMethodSchema = z.enum(SUBSCRIPTION_PAYMENT_METHODS);
+
+/** تغيير الباقة ذاتيًا: الباقات القياسية فقط (المبتدئة للتجربة، المؤسسية للمنصة) */
+export const changePlanSchema = z.object({
+  plan: z.enum(SELF_SERVICE_PLAN_KEYS),
+});
+
+/** تفعيل/تجديد ذاتي بعد دفع خارج المنصة — بيانات الدفع إلزامية */
+export const activateSubscriptionSchema = z.object({
+  plan: z.enum(SELF_SERVICE_PLAN_KEYS),
+  months: monthsSchema.optional().default(1),
+  paymentMethod: paymentMethodSchema,
+  paymentReference: z.string().trim().min(3, 'مرجع الدفع قصير جدًا').max(100),
+  paymentNote: z.string().trim().max(500).optional().default(''),
+});
+
+/** طلب تجديد/عرض سعر — متاح للمركز المحظور ويشمل المؤسسية */
+export const createRenewalRequestSchema = z.object({
+  plan: z.enum(PLATFORM_PLAN_KEYS),
+  months: monthsSchema.optional().default(1),
+  paymentMethod: paymentMethodSchema.optional().default('bank_transfer'),
+  paymentReference: z.string().trim().max(100).optional().default(''),
+  note: z.string().trim().max(500).optional().default(''),
+});
+
+export const rejectRenewalRequestSchema = z.object({
+  note: trimmedString(2, 500),
+});
+
+export const approveRenewalRequestSchema = z.object({
+  months: monthsSchema.optional(),
+  monthlyPriceEgp: priceSchema.optional(),
+  amountEgp: priceSchema.optional(),
+  paymentMethod: paymentMethodSchema.optional(),
+  paymentReference: z.string().trim().max(100).optional(),
+  note: z.string().trim().max(500).optional().default(''),
+});
+
+/** تغيير باقة من إدارة المنصة — يشمل المؤسسية بسعر مخصص */
+export const platformChangePlanSchema = z.object({
+  plan: z.enum(PLATFORM_PLAN_KEYS),
+  monthlyPriceEgp: priceSchema.optional(),
+});
+
+/** تفعيل اشتراك من إدارة المنصة — الدفعة اختيارية (منحة/تسوية) */
+export const platformActivateSubscriptionSchema = z.object({
+  plan: z.enum(PLATFORM_PLAN_KEYS),
+  months: monthsSchema.optional().default(1),
+  monthlyPriceEgp: priceSchema.optional(),
+  amountEgp: priceSchema.optional(),
+  paymentMethod: paymentMethodSchema.optional(),
+  paymentReference: z.string().trim().max(100).optional().default(''),
+  paymentNote: z.string().trim().max(500).optional().default(''),
 });

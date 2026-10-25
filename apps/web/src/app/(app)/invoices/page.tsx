@@ -205,7 +205,9 @@ export default function InvoicesPage() {
                   data.items.map((invoice) => (
                     <tr key={invoice._id}>
                       <td className="font-bold text-ink-900" dir="ltr">
-                        {invoice.invoiceNumber}
+                        <Link href={`/invoices/${invoice._id}`} className="text-brand-700 hover:underline">
+                          {invoice.invoiceNumber}
+                        </Link>
                       </td>
                       <td className="text-xs">
                         <p className="text-ink-700">{invoice.customerId?.fullName ?? '—'}</p>

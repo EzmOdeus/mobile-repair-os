@@ -189,6 +189,8 @@ export default function TicketDetailPage() {
   const [decidingEstimateId, setDecidingEstimateId] = useState<string | null>(null);
   const [rejectFor, setRejectFor] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState('');
+  const [issuingInvoice, setIssuingInvoice] = useState(false);
+  const [partActionId, setPartActionId] = useState<string | null>(null);
 
   const { data: technicians } = useSWR<{ id: string; fullName: string; activeJobs: number; maxActiveJobs: number; isAvailable: boolean }[]>(
     hasPermission('technician:read') ? '/technicians/available' : null,
@@ -319,6 +321,55 @@ export default function TicketDetailPage() {
   };
 
   const totalCost = ticket.cost.totalFinalEgp ?? ticket.cost.totalQuotedEgp ?? 0;
+  const invoicePaid = invoices.reduce((sum, invoice) => sum + (invoice.totals.paidEgp ?? 0), 0);
+  const invoiceDue = invoices.reduce((sum, invoice) => sum + (invoice.totals.dueEgp ?? 0), 0);
+  const paidAmount = invoices.length ? invoicePaid : (ticket.cost.paidEgp ?? 0);
+  const dueAmount = invoices.length ? invoiceDue : Math.max(0, totalCost - paidAmount);
+
+  const issueInvoice = async () => {
+    setIssuingInvoice(true);
+    try {
+      const invoice = await api.post<{ invoiceNumber: string }>('/finance/invoices', {
+        type: 'repair',
+        buildFromTicket: true,
+        ticketId,
+        discountEgp: ticket.cost.discountEgp ?? 0,
+        issueNow: true,
+      });
+      toast.success(`أُصدرت الفاتورة ${invoice.invoiceNumber}`);
+      await Promise.all([refresh(), mutate('/tickets/board'), mutate('/finance/summary?period=last30')]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIssuingInvoice(false);
+    }
+  };
+
+  const updatePartStatus = async (partId: string, status: string, label: string) => {
+    setPartActionId(partId);
+    try {
+      await api.patch(`/tickets/${ticketId}/parts/${partId}`, { status });
+      toast.success(label);
+      await Promise.all([refresh(), mutate('/tickets/board')]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setPartActionId(null);
+    }
+  };
+
+  const removePart = async (partId: string) => {
+    setPartActionId(partId);
+    try {
+      await api.del(`/tickets/${ticketId}/parts/${partId}`);
+      toast.success('أُزيلت القطعة وسُوّي المخزون');
+      await Promise.all([refresh(), mutate('/tickets/board')]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setPartActionId(null);
+    }
+  };
 
   return (
     <div>
@@ -469,6 +520,7 @@ export default function TicketDetailPage() {
                     <th>سعر الوحدة</th>
                     <th>الإجمالي</th>
                     <th>الضمان</th>
+                    {hasPermission('part:manage') ? <th>إجراءات</th> : null}
                   </tr>
                 </thead>
                 <tbody>
@@ -496,13 +548,70 @@ export default function TicketDetailPage() {
                               ? 'معيبة'
                               : part.status === 'reserved'
                                 ? 'محجوزة'
-                                : part.status}
+                                : part.status === 'removed'
+                                  ? 'مفكوكة'
+                                  : part.status === 'returned'
+                                    ? 'مرتجعة'
+                                    : part.status}
                         </Badge>
                       </td>
                       <td className="num text-xs">{part.quantity}</td>
                       <td className="num text-xs">{formatMoney(part.unitPriceEgp)}</td>
                       <td className="num text-xs font-bold">{formatMoney(part.totalPriceEgp)}</td>
                       <td className="text-xs">{part.warrantyDays ? `${part.warrantyDays} يوم` : '—'}</td>
+                      {hasPermission('part:manage') ? (
+                        <td className="whitespace-nowrap">
+                          {part.status === 'reserved' ? (
+                            <div className="flex flex-wrap gap-1">
+                              <button
+                                type="button"
+                                className="btn-ghost px-1.5 py-0.5 text-[11px] text-emerald-700"
+                                disabled={partActionId === part._id}
+                                onClick={() => void updatePartStatus(part._id, 'installed', 'سُجّلت القطعة كمثبتة واستُهلكت من المخزون')}
+                              >
+                                تركيب
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost px-1.5 py-0.5 text-[11px] text-red-600"
+                                disabled={partActionId === part._id}
+                                onClick={() => void updatePartStatus(part._id, 'defective', 'سُجّلت القطعة معيبة')}
+                              >
+                                معيبة
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost px-1.5 py-0.5 text-[11px]"
+                                disabled={partActionId === part._id}
+                                onClick={() => void removePart(part._id)}
+                              >
+                                إلغاء الحجز
+                              </button>
+                            </div>
+                          ) : part.status === 'installed' ? (
+                            <div className="flex flex-wrap gap-1">
+                              <button
+                                type="button"
+                                className="btn-ghost px-1.5 py-0.5 text-[11px]"
+                                disabled={partActionId === part._id}
+                                onClick={() => void updatePartStatus(part._id, 'removed', 'فُكّت القطعة وأُرجعت للمخزون')}
+                              >
+                                فك وإرجاع
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost px-1.5 py-0.5 text-[11px] text-red-600"
+                                disabled={partActionId === part._id}
+                                onClick={() => void updatePartStatus(part._id, 'defective', 'سُجّلت القطعة معيبة')}
+                              >
+                                معيبة
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-[11px] text-ink-400">—</span>
+                          )}
+                        </td>
+                      ) : null}
                     </tr>
                   ))}
                   {labor.map((item) => (
@@ -515,11 +624,12 @@ export default function TicketDetailPage() {
                       <td className="num text-xs">{formatMoney(item.amountEgp)}</td>
                       <td className="num text-xs font-bold">{formatMoney(item.amountEgp)}</td>
                       <td className="text-xs">—</td>
+                      {hasPermission('part:manage') ? <td /> : null}
                     </tr>
                   ))}
                   {!parts.length && !labor.length ? (
                     <tr>
-                      <td colSpan={6}>
+                      <td colSpan={hasPermission('part:manage') ? 7 : 6}>
                         <EmptyState title="لا توجد بنود بعد" icon={<Package size={20} />} />
                       </td>
                     </tr>
@@ -711,11 +821,11 @@ export default function TicketDetailPage() {
               <div className="border-t border-ink-100 pt-2">
                 <Row label="الإجمالي النهائي" value={formatMoney(totalCost)} bold />
               </div>
-              <Row label="المدفوع" value={formatMoney(ticket.cost.paidEgp ?? 0)} />
+              <Row label="المدفوع" value={formatMoney(paidAmount)} />
               <Row
                 label="المتبقي"
-                value={formatMoney(ticket.cost.dueEgp ?? 0)}
-                tone={(ticket.cost.dueEgp ?? 0) > 0 ? 'danger' : 'success'}
+                value={formatMoney(dueAmount)}
+                tone={dueAmount > 0 ? 'danger' : 'success'}
                 bold
               />
             </dl>
@@ -863,30 +973,51 @@ export default function TicketDetailPage() {
           </Card>
 
           {/* الفواتير */}
-          {invoices.length ? (
-            <Card>
-              <CardHeader title="الفواتير" icon={<Receipt size={18} />} />
-              <div className="card-pad space-y-2">
-                {invoices.map((invoice) => (
-                  <Link
-                    key={invoice._id}
-                    href={`/invoices/${invoice._id}`}
-                    className="flex items-center justify-between rounded-lg border border-ink-200 p-2.5 transition hover:border-brand-400"
+          <Card>
+            <CardHeader
+              title="الفواتير"
+              subtitle={invoices.length ? `${invoices.length} فاتورة` : 'لا توجد فواتير بعد'}
+              icon={<Receipt size={18} />}
+              action={
+                hasPermission('invoice:write') && totalCost > 0 ? (
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs"
+                    onClick={() => void issueInvoice()}
+                    disabled={issuingInvoice}
                   >
-                    <span className="text-xs font-bold text-ink-800" dir="ltr">
-                      {invoice.invoiceNumber}
+                    {issuingInvoice ? 'جارٍ الإصدار…' : 'إصدار فاتورة'}
+                  </button>
+                ) : undefined
+              }
+            />
+            <div className="card-pad space-y-2">
+              {invoices.map((invoice) => (
+                <Link
+                  key={invoice._id}
+                  href={`/invoices/${invoice._id}`}
+                  className="flex items-center justify-between rounded-lg border border-ink-200 p-2.5 transition hover:border-brand-400"
+                >
+                  <span className="text-xs font-bold text-ink-800" dir="ltr">
+                    {invoice.invoiceNumber}
+                  </span>
+                  <span className="text-left">
+                    <span className="block text-xs font-bold num">{formatMoney(invoice.totals.totalEgp)}</span>
+                    <span className={`block text-[11px] num ${invoice.totals.dueEgp > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
+                      {invoice.totals.dueEgp > 0 ? `متبقي ${formatMoney(invoice.totals.dueEgp)}` : 'مدفوعة'}
                     </span>
-                    <span className="text-left">
-                      <span className="block text-xs font-bold num">{formatMoney(invoice.totals.totalEgp)}</span>
-                      <span className={`block text-[11px] num ${invoice.totals.dueEgp > 0 ? 'text-red-600' : 'text-emerald-600'}`}>
-                        {invoice.totals.dueEgp > 0 ? `متبقي ${formatMoney(invoice.totals.dueEgp)}` : 'مدفوعة'}
-                      </span>
-                    </span>
-                  </Link>
-                ))}
-              </div>
-            </Card>
-          ) : null}
+                  </span>
+                </Link>
+              ))}
+              {!invoices.length ? (
+                <p className="text-xs text-ink-500">
+                  {hasPermission('invoice:write')
+                    ? 'اضغط «إصدار فاتورة» لإنشاء فاتورة من بنود عرض السعر المعتمد أو المصنعية والقطع.'
+                    : 'ستظهر الفاتورة هنا بعد إصدارها من الاستقبال.'}
+                </p>
+              ) : null}
+            </div>
+          </Card>
 
           {/* الضمان */}
           {ticket.warranty.policyDays ? (

@@ -20,12 +20,28 @@ interface NotificationRow {
   body: string;
   toPhone?: string;
   trackingUrl?: string;
+  variables?: Record<string, string>;
   readAt?: string | null;
   sentAt?: string | null;
   createdAt: string;
   errorMessage?: string;
-  customerId?: { fullName: string; phone: string } | null;
+  customerId?: { _id?: string; fullName: string; phone: string } | null;
   ticketId?: { _id?: string; ticketNumber: string } | null;
+  listingId?: { _id?: string; title: string; status: string } | null;
+}
+
+/** الصفحة التي يفتحها الإشعار عند الضغط عليه */
+function notificationHref(notification: NotificationRow): string | null {
+  const listingId = notification.listingId?._id ?? notification.variables?.listingId;
+  if (listingId) return `/market/${listingId}`;
+  if (notification.type.startsWith('market_')) return '/market?tab=offers';
+  if (notification.ticketId?._id) return `/tickets/${notification.ticketId._id}`;
+  if (notification.type.startsWith('subscription_')) return '/settings';
+  if (notification.type.startsWith('warranty_')) return '/warranty';
+  if (notification.type.startsWith('payment_')) return '/invoices';
+  if (notification.type === 'low_stock') return '/inventory?tab=lowStock';
+  if (notification.customerId?._id) return `/customers/${notification.customerId._id}`;
+  return null;
 }
 
 const TYPE_LABELS: Record<string, string> = {
@@ -41,12 +57,22 @@ const TYPE_LABELS: Record<string, string> = {
   payment_received: 'تم التحصيل',
   payment_due: 'مبلغ مستحق',
   warranty_reminder: 'تذكير بالضمان',
+  warranty_claim_received: 'مطالبة ضمان جديدة',
   review_request: 'طلب تقييم',
   sla_warning: 'تحذير موعد التسليم',
   sla_breach: 'تجاوز موعد التسليم',
   internal_assignment: 'تعيين مهمة',
   low_stock: 'مخزون منخفض',
   ticket_cancelled: 'إلغاء الطلب',
+  subscription_expiring: 'اشتراك على وشك الانتهاء',
+  subscription_expired: 'انتهاء الاشتراك',
+  subscription_activated: 'تفعيل اشتراك',
+  subscription_renewal_rejected: 'رفض طلب تجديد',
+  market_offer_received: 'عرض شراء جديد',
+  market_offer_accepted: 'قبول عرض',
+  market_offer_rejected: 'رفض عرض',
+  market_listing_approved: 'اعتماد إعلان',
+  market_listing_rejected: 'رفض إعلان',
   custom: 'رسالة مخصصة',
 };
 
@@ -82,6 +108,8 @@ export default function NotificationsPage() {
     page,
     limit: 30,
   })}`;
+  // نفس مفتاح عدّاد الجرس في AppShell — نُحدّثه فور تعليم القراءة
+  const badgeKey = '/notifications?channel=in_app&limit=1';
 
   const { data, error, isLoading } = useSWR<{
     items: NotificationRow[];
@@ -92,9 +120,19 @@ export default function NotificationsPage() {
     try {
       await api.post('/notifications/read-all');
       toast.success('تم تعليم كل الإشعارات كمقروءة');
-      await mutate(key);
+      await Promise.all([mutate(key), mutate(badgeKey)]);
     } catch (err) {
       toast.error(errorMessage(err));
+    }
+  };
+
+  const markRead = async (notification: NotificationRow) => {
+    if (notification.readAt) return;
+    try {
+      await api.post(`/notifications/${notification._id}/read`);
+      await Promise.all([mutate(key), mutate(badgeKey)]);
+    } catch {
+      // فشل تعليم القراءة لا يمنع الانتقال لصفحة الإشعار
     }
   };
 
@@ -163,8 +201,9 @@ export default function NotificationsPage() {
         ) : (
           <div className="divide-y divide-ink-100">
             {data?.items?.length ? (
-              data.items.map((notification) => (
-                <div key={notification._id} className={`px-4 py-3 ${notification.readAt ? '' : 'bg-brand-50/30'}`}>
+              data.items.map((notification) => {
+                const href = notificationHref(notification);
+                const content = (
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -196,13 +235,12 @@ export default function NotificationsPage() {
                           <span className="text-[11px] text-ink-500">{notification.customerId.fullName}</span>
                         ) : null}
                         {notification.ticketId ? (
-                          <Link
-                            href={`/tickets/${notification.ticketId._id ?? ''}`}
-                            className="text-[11px] text-brand-700 hover:underline"
-                            dir="ltr"
-                          >
+                          <span className="text-[11px] text-brand-700" dir="ltr">
                             {notification.ticketId.ticketNumber}
-                          </Link>
+                          </span>
+                        ) : null}
+                        {notification.listingId ? (
+                          <span className="max-w-[16rem] truncate text-[11px] text-brand-700">{notification.listingId.title}</span>
                         ) : null}
                       </div>
 
@@ -222,8 +260,27 @@ export default function NotificationsPage() {
                       ) : null}
                     </div>
                   </div>
-                </div>
-              ))
+                );
+
+                const rowClass = `block px-4 py-3 transition ${notification.readAt ? '' : 'bg-brand-50/30'} ${
+                  href ? 'cursor-pointer hover:bg-brand-50/70' : ''
+                }`;
+
+                return href ? (
+                  <Link
+                    key={notification._id}
+                    href={href}
+                    className={rowClass}
+                    onClick={() => void markRead(notification)}
+                  >
+                    {content}
+                  </Link>
+                ) : (
+                  <div key={notification._id} className={rowClass}>
+                    {content}
+                  </div>
+                );
+              })
             ) : (
               <EmptyState title="لا توجد إشعارات" description="ستظهر هنا كل الرسائل الصادرة للعملاء" icon={<Bell size={22} />} />
             )}

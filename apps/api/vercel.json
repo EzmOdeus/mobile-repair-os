@@ -1,15 +1,11 @@
 {
- "version": 2,
- "builds": [
-   {
-  "src": "./dist/server.js",
-  "use": "@vercel/node"
-   }
- ],
- "routes": [
-   {
-  "src": "/(.*)",
-  "dest": "/dist/server.js"
-   }
- ]
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
+  "buildCommand": "npm run build",
+  "functions": {
+    "server.js": {
+      "includeFiles": "{assets,docs}/**",
+      "maxDuration": 60
+    }
+  }
 }

@@ -17,12 +17,14 @@ const FEATURES = [
 
 export default function LoginPage() {
   const router = useRouter();
-  const { login, isAuthenticated, isLoading, user } = useAuth();
+  const { login, verifyTwoFactor, isAuthenticated, isLoading, user } = useAuth();
   const toast = useToast();
 
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [organizationSlug, setOrganizationSlug] = useState('');
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [twoFactorCode, setTwoFactorCode] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,7 +38,27 @@ export default function LoginPage() {
     setError(null);
     setIsSubmitting(true);
     try {
-      await login(identifier.trim(), password, organizationSlug.trim() || undefined);
+      if (challengeToken) {
+        const code = twoFactorCode.replace(/\s+/g, '');
+        if (code.length < 6) {
+          setError('أدخل رمز التحقق المكوّن من 6 أرقام أو رمز استرداد');
+          return;
+        }
+        await verifyTwoFactor(challengeToken, code);
+        toast.success('تم التحقق وتسجيل الدخول');
+        router.replace(homePathForRole(getStoredUser()?.role));
+        return;
+      }
+
+      const result = await login(identifier.trim(), password, organizationSlug.trim() || undefined);
+      if (result.twoFactorRequired) {
+        setChallengeToken(result.challengeToken);
+        setPassword('');
+        setTwoFactorCode('');
+        toast.success('أدخل رمز التحقق من تطبيق المصادقة');
+        return;
+      }
+
       toast.success('تم تسجيل الدخول بنجاح');
       router.replace(homePathForRole(getStoredUser()?.role));
     } catch (err) {
@@ -51,6 +73,13 @@ export default function LoginPage() {
   const fillDemo = (user: string, pass: string) => {
     setIdentifier(user);
     setPassword(pass);
+    setError(null);
+  };
+
+  const resetChallenge = () => {
+    setChallengeToken(null);
+    setTwoFactorCode('');
+    setPassword('');
     setError(null);
   };
 
@@ -100,60 +129,115 @@ export default function LoginPage() {
             </span>
           </div>
 
-          <h2 className="text-xl font-bold text-ink-900">تسجيل الدخول</h2>
-          <p className="mt-1 text-sm text-ink-500">ادخل بيانات حسابك للوصول إلى لوحة التشغيل.</p>
+          <h2 className="text-xl font-bold text-ink-900">
+            {challengeToken ? 'التحقق بخطوتين' : 'تسجيل الدخول'}
+          </h2>
+          <p className="mt-1 text-sm text-ink-500">
+            {challengeToken ? 'أدخل الرمز من تطبيق المصادقة لإتمام الدخول.' : 'ادخل بيانات حسابك للوصول إلى لوحة التشغيل.'}
+          </p>
 
-          <form onSubmit={onSubmit} className="mt-6 space-y-4">
-            <label className="block">
-              <span className="label">اسم المستخدم أو البريد الإلكتروني</span>
-              <input
-                className="input"
-                value={identifier}
-                onChange={(e) => setIdentifier(e.target.value)}
-                placeholder="owner"
-                autoComplete="username"
-                required
-                dir="ltr"
-              />
-            </label>
+          {challengeToken ? (
+            <div className="mt-6 space-y-4">
+              <div className="flex items-start gap-3 rounded-xl border border-brand-200 bg-brand-50 p-3.5">
+                <ShieldCheck size={20} className="mt-0.5 shrink-0 text-brand-700" />
+                <div className="text-xs leading-relaxed text-brand-800">
+                  <p className="font-bold">الحساب محمي بالتحقق بخطوتين</p>
+                  <p className="mt-0.5">
+                    افتح تطبيق المصادقة وأدخل الرمز الحالي المكوّن من 6 أرقام. يمكنك أيضًا استخدام أحد رموز الاسترداد.
+                  </p>
+                </div>
+              </div>
 
-            <label className="block">
-              <span className="label">كلمة المرور</span>
-              <input
-                className="input"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                autoComplete="current-password"
-                required
-                dir="ltr"
-              />
-            </label>
+              <form onSubmit={onSubmit} className="space-y-4">
+                <label className="block">
+                  <span className="label">رمز التحقق أو رمز الاسترداد</span>
+                  <input
+                    className="input text-center text-lg tracking-[0.35em]"
+                    value={twoFactorCode}
+                    onChange={(e) => setTwoFactorCode(e.target.value)}
+                    placeholder="123456"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    autoFocus
+                    required
+                    maxLength={20}
+                    dir="ltr"
+                  />
+                  <span className="mt-1 block text-xs text-ink-400">
+                    الخطوة صالحة 5 دقائق، والرمز يتغيّر كل 30 ثانية.
+                  </span>
+                </label>
 
-            <label className="block">
-              <span className="label">معرّف المركز (اختياري)</span>
-              <input
-                className="input"
-                value={organizationSlug}
-                onChange={(e) => setOrganizationSlug(e.target.value)}
-                placeholder="mobile-care-eg"
-                dir="ltr"
-              />
-              <span className="mt-1 block text-xs text-ink-400">
-                يُستخدم فقط لو نفس اسم المستخدم موجود في أكثر من مركز.
-              </span>
-            </label>
+                {error ? (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{error}</div>
+                ) : null}
 
-            {error ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{error}</div>
-            ) : null}
+                <button type="submit" className="btn-primary w-full" disabled={isSubmitting}>
+                  {isSubmitting ? 'جارٍ التحقق…' : 'تحقق ودخول'}
+                </button>
+                <button type="button" className="btn-secondary w-full" onClick={resetChallenge} disabled={isSubmitting}>
+                  العودة لتسجيل الدخول
+                </button>
+              </form>
+            </div>
+          ) : (
+            <form onSubmit={onSubmit} className="mt-6 space-y-4">
+              <label className="block">
+                <span className="label">اسم المستخدم أو البريد الإلكتروني</span>
+                <input
+                  className="input"
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder="owner"
+                  autoComplete="username"
+                  required
+                  dir="ltr"
+                />
+              </label>
 
-            <button type="submit" className="btn-primary w-full" disabled={isSubmitting}>
-              {isSubmitting ? 'جارٍ التحقق…' : 'دخول'}
-            </button>
-          </form>
+              <label className="block">
+                <span className="label">كلمة المرور</span>
+                <input
+                  className="input"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  autoComplete="current-password"
+                  required
+                  dir="ltr"
+                />
+              </label>
 
+              <label className="block">
+                <span className="label">معرّف المركز (اختياري)</span>
+                <input
+                  className="input"
+                  value={organizationSlug}
+                  onChange={(e) => setOrganizationSlug(e.target.value)}
+                  placeholder="mobile-care-eg"
+                  dir="ltr"
+                />
+                <span className="mt-1 block text-xs text-ink-400">
+                  يُستخدم فقط لو نفس اسم المستخدم موجود في أكثر من مركز.
+                </span>
+              </label>
+
+              {error ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">{error}</div>
+              ) : null}
+
+              <button type="submit" className="btn-primary w-full" disabled={isSubmitting}>
+                {isSubmitting ? 'جارٍ التحقق…' : 'دخول'}
+              </button>
+              <Link href="/forgot-password" className="block text-center text-xs text-brand-700 hover:underline">
+                نسيت كلمة المرور؟
+              </Link>
+            </form>
+          )}
+
+          {!challengeToken ? (
+            <>
           {/* إنشاء حساب مركز جديد */}
           <div className="mt-6 border-t border-ink-200 pt-5">
             <p className="text-center text-xs text-ink-500">صاحب مركز صيانة وليس لديك حساب؟</p>
@@ -192,6 +276,8 @@ export default function LoginPage() {
               ))}
             </div>
           </div>
+            </>
+          ) : null}
         </div>
       </div>
     </div>

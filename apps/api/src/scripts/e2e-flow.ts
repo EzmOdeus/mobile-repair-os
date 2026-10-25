@@ -426,10 +426,17 @@ async function main(): Promise<void> {
     partial.data?.invoice.status,
   );
 
+  const remainingDue = Math.round(((invoice.data?.totals.dueEgp ?? 0) - 100) * 100) / 100;
+  const overpay = await call('POST', '/finance/payments', { invoiceId, method: 'cash', amountEgp: remainingDue + 100 }, token);
+  check('منع تحصيل مبلغ أكبر من المتبقي', overpay.status === 422, {
+    status: overpay.status,
+    code: overpay.error?.code,
+  });
+
   const payFull = await call<{ invoice: { status: string }; payment: { receiptNumber: string } }>(
     'POST',
     '/finance/payments',
-    { invoiceId, method: 'instapay', amountEgp: 5000, reference: 'IPN-TEST' },
+    { invoiceId, method: 'instapay', amountEgp: remainingDue, reference: 'IPN-TEST' },
     token,
   );
   check('تحصيل باقي المبلغ', payFull.ok, payFull.error);

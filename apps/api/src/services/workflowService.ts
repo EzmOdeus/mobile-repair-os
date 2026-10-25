@@ -323,7 +323,7 @@ export async function transitionTicket(
 
   // إشعارات العميل المرتبطة بالحالة (تُتخطى إذا أرسل المتصل رسالة مخصصة بنفسه)
   if (options.notifyCustomer !== false) {
-    await notifyTicketEvent(ticket, target, actor);
+    await notifyTicketEvent(ticket, target, actor, current);
   }
 
   await recordAudit({

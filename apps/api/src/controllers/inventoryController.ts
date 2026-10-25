@@ -10,7 +10,7 @@ import { RepairPartModel } from '../models/RepairPart.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok, paginated } from '../utils/asyncHandler.js';
 import { parseCsv, parseListQuery, parseSort, regexSearch } from '../utils/queryHelpers.js';
-import { getAuth } from '../middleware/auth.js';
+import { branchFilter, getAuth, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { money } from '../utils/money.js';
@@ -141,19 +141,69 @@ export const listParts = async (req: Request, res: Response) => {
   const { page, limit, skip } = parseListQuery(req.query as Record<string, unknown>, 40);
   const sort = parseSort(req.query as Record<string, unknown>, ['createdAt', 'name', 'pricing.sellingPriceEgp', 'stock.onHand'], { name: 1 });
   const filter = buildPartFilter(req);
+  const scopedBranch = branchFilter(req);
 
   const [items, total] = await Promise.all([
     PartModel.find(filter).sort(sort).skip(skip).limit(limit).lean(),
     PartModel.countDocuments(filter),
   ]);
 
+  /**
+   * عند تحديد فرع نشط نعرض رصيد هذا الفرع (InventoryItem) وليس الإجمالي المجمّع
+   * على مستوى المؤسسة. هذا يمنع بيع قطعة من POS وهي موجودة في فرع آخر فقط.
+   */
+  const branchStock = new Map<
+    string,
+    { onHand: number; reserved: number; defective: number; incoming: number; reorderLevel: number }
+  >();
+  if (scopedBranch && items.length) {
+    const stocks = await InventoryItemModel.find({
+      branchId: scopedBranch,
+      partId: { $in: items.map((p) => p._id) },
+    })
+      .select('partId quantity reorderLevel')
+      .lean();
+    for (const stock of stocks) {
+      branchStock.set(String(stock.partId), {
+        onHand: stock.quantity?.onHand ?? 0,
+        reserved: stock.quantity?.reserved ?? 0,
+        defective: stock.quantity?.defective ?? 0,
+        incoming: stock.quantity?.incoming ?? 0,
+        reorderLevel: stock.reorderLevel ?? 0,
+      });
+    }
+  }
+
   return paginated(
     res,
-    items.map((p) => ({
-      ...p,
-      availableQty: Math.max(0, (p.stock?.onHand ?? 0) - (p.stock?.reserved ?? 0)),
-      isLowStock: Math.max(0, (p.stock?.onHand ?? 0) - (p.stock?.reserved ?? 0)) <= (p.stock?.reorderLevel ?? 0),
-    })),
+    items.map((p) => {
+      const branch = scopedBranch ? branchStock.get(String(p._id)) : null;
+      if (scopedBranch) {
+        const onHand = branch?.onHand ?? 0;
+        const reserved = branch?.reserved ?? 0;
+        const reorderLevel = branch?.reorderLevel ?? 0;
+        const available = Math.max(0, onHand - reserved);
+        return {
+          ...p,
+          stock: {
+            ...p.stock,
+            onHand,
+            reserved,
+            defective: branch?.defective ?? 0,
+            incoming: branch?.incoming ?? 0,
+            reorderLevel,
+          },
+          availableQty: available,
+          isLowStock: available <= reorderLevel,
+        };
+      }
+      const available = Math.max(0, (p.stock?.onHand ?? 0) - (p.stock?.reserved ?? 0));
+      return {
+        ...p,
+        availableQty: available,
+        isLowStock: available <= (p.stock?.reorderLevel ?? 0),
+      };
+    }),
     { page, limit, total },
   );
 };
@@ -283,7 +333,52 @@ export const deletePart = async (req: Request, res: Response) => {
 };
 
 /** قطع منخفضة عن حد إعادة الطلب */
-export const lowStockParts = async (_req: Request, res: Response) => {
+export const lowStockParts = async (req: Request, res: Response) => {
+  const scopedBranch = branchFilter(req);
+
+  if (scopedBranch) {
+    const lowItems = await InventoryItemModel.find({
+      branchId: scopedBranch,
+      isActive: true,
+      $expr: { $lte: [{ $subtract: ['$quantity.onHand', '$quantity.reserved'] }, '$reorderLevel'] },
+    })
+      .select('partId quantity reorderLevel')
+      .sort({ 'quantity.onHand': 1 })
+      .limit(200)
+      .lean();
+
+    const parts = await PartModel.find({ _id: { $in: lowItems.map((i) => i.partId) }, isActive: true })
+      .select('name sku category stock pricing.costEgp defaultSupplierId')
+      .populate('defaultSupplierId', 'name phone')
+      .lean();
+    const partMap = new Map(parts.map((p) => [String(p._id), p]));
+
+    return ok(res, {
+      count: lowItems.length,
+      parts: lowItems
+        .map((item) => {
+          const part = partMap.get(String(item.partId));
+          if (!part) return null;
+          const available = Math.max(0, (item.quantity?.onHand ?? 0) - (item.quantity?.reserved ?? 0));
+          return {
+            ...part,
+            stock: {
+              ...part.stock,
+              onHand: item.quantity?.onHand ?? 0,
+              reserved: item.quantity?.reserved ?? 0,
+              defective: item.quantity?.defective ?? 0,
+              incoming: item.quantity?.incoming ?? 0,
+              reorderLevel: item.reorderLevel ?? 0,
+            },
+            availableQty: available,
+            suggestedOrderQty: item.quantity?.incoming ? 0 : Math.max(1, (item.reorderLevel ?? 5) - available),
+            estimatedCostEgp: money(Math.max(1, (item.reorderLevel ?? 5) - available) * (part.pricing?.costEgp ?? 0)),
+          };
+        })
+        .filter(Boolean),
+    });
+  }
+
   const parts = await PartModel.find({
     isActive: true,
     $expr: { $lte: [{ $subtract: ['$stock.onHand', '$stock.reserved'] }, '$stock.reorderLevel'] },
@@ -309,9 +404,9 @@ export const lowStockParts = async (_req: Request, res: Response) => {
 
 /** رصيد المخزون حسب الفرع */
 export const inventoryStock = async (req: Request, res: Response) => {
-  const query = req.query as Record<string, unknown>;
   const filter: Record<string, unknown> = {};
-  if (query.branchId) filter.branchId = query.branchId;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
 
   const items = await InventoryItemModel.find(filter)
     .populate('partId', 'name sku category grade pricing cost')
@@ -328,7 +423,7 @@ export const inventoryStock = async (req: Request, res: Response) => {
     defective: number;
     incoming: number;
   }>([
-    { $match: { ...(query.branchId ? { branchId: new Types.ObjectId(String(query.branchId)) } : {}) } },
+    { $match: { ...(scopedBranch ? { branchId: new Types.ObjectId(String(scopedBranch)) } : {}) } },
     {
       $group: {
         _id: null,
@@ -489,6 +584,8 @@ export const listStockMovements = async (req: Request, res: Response) => {
 
   const filter: Record<string, unknown> = {};
   if (query.partId) filter.partId = query.partId;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
   const types = parseCsv(query.type);
   if (types.length) filter.type = { $in: types };
   if (query.ticketId) filter.ticketId = query.ticketId;
@@ -503,6 +600,7 @@ export const listStockMovements = async (req: Request, res: Response) => {
     StockMovementModel.find(filter)
       .populate('partId', 'name sku category')
       .populate('actorId', 'fullName')
+      .populate('branchId', 'name code')
       .sort({ occurredAt: -1 })
       .skip(skip)
       .limit(limit)
@@ -522,6 +620,8 @@ export const partsConsumptionReport = async (req: Request, res: Response) => {
 
   const match: Record<string, unknown> = { status: { $in: ['installed', 'defective'] } };
   if (Object.keys(range).length) match.installedAt = range;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) match.branchId = scopedBranch;
 
   const usage = await RepairPartModel.aggregate<{
     _id: Types.ObjectId;
@@ -566,8 +666,127 @@ export const partsConsumptionReport = async (req: Request, res: Response) => {
   );
 };
 
-/* ========================= تحويل بين الفروع ========================= */
+/** تقييم المخزون بالتكلفة: إجمالي وقيمة لكل فرع، مع القطع منخفضة الرصيد */
+export const stockValuation = async (req: Request, res: Response) => {
+  const filter: Record<string, unknown> = {};
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
 
+  const items = await InventoryItemModel.find(filter)
+    .populate('partId', 'name sku category pricing.costEgp pricing.sellingPriceEgp stock.reorderLevel')
+    .populate('branchId', 'name code')
+    .lean();
+
+  type BranchBucket = {
+    branchId: string;
+    branchName: string;
+    branchCode: string;
+    parts: number;
+    onHand: number;
+    reserved: number;
+    defective: number;
+    valueEgp: number;
+    sellValueEgp: number;
+  };
+  const branches = new Map<string, BranchBucket>();
+  let totalValue = 0;
+  let totalSellValue = 0;
+  let totalOnHand = 0;
+  let totalDefective = 0;
+  const lowStock: {
+    partId: string;
+    name: string;
+    sku: string;
+    branchName: string;
+    onHand: number;
+    reserved: number;
+    available: number;
+    reorderLevel: number;
+  }[] = [];
+
+  for (const item of items) {
+    const part = item.partId as unknown as
+      | {
+          _id: Types.ObjectId;
+          name: string;
+          sku: string;
+          category: string;
+          pricing?: { costEgp?: number; sellingPriceEgp?: number };
+          stock?: { reorderLevel?: number };
+        }
+      | null;
+    const branch = item.branchId as unknown as { _id: Types.ObjectId; name: string; code: string } | null;
+    if (!part) continue;
+
+    const key = String(branch?._id ?? '');
+    let bucket = branches.get(key);
+    if (!bucket) {
+      bucket = {
+        branchId: key,
+        branchName: branch?.name ?? '—',
+        branchCode: branch?.code ?? '',
+        parts: 0,
+        onHand: 0,
+        reserved: 0,
+        defective: 0,
+        valueEgp: 0,
+        sellValueEgp: 0,
+      };
+      branches.set(key, bucket);
+    }
+
+    const onHand = item.quantity?.onHand ?? 0;
+    const reserved = item.quantity?.reserved ?? 0;
+    const defective = item.quantity?.defective ?? 0;
+    const cost = money(part.pricing?.costEgp ?? 0);
+    const selling = money(part.pricing?.sellingPriceEgp ?? 0);
+    const value = money(onHand * cost);
+    const sellValue = money(onHand * selling);
+
+    bucket.parts += 1;
+    bucket.onHand += onHand;
+    bucket.reserved += reserved;
+    bucket.defective += defective;
+    bucket.valueEgp = money(bucket.valueEgp + value);
+    bucket.sellValueEgp = money(bucket.sellValueEgp + sellValue);
+
+    totalValue = money(totalValue + value);
+    totalSellValue = money(totalSellValue + sellValue);
+    totalOnHand += onHand;
+    totalDefective += defective;
+
+    const available = Math.max(0, onHand - reserved);
+    const reorderLevel = part.stock?.reorderLevel ?? 2;
+    if (available <= reorderLevel) {
+      lowStock.push({
+        partId: String(part._id),
+        name: part.name,
+        sku: part.sku,
+        branchName: bucket.branchName,
+        onHand,
+        reserved,
+        available,
+        reorderLevel,
+      });
+    }
+  }
+
+  return ok(res, {
+    totals: {
+      branches: branches.size,
+      parts: items.length,
+      onHand: totalOnHand,
+      defective: totalDefective,
+      valueEgp: totalValue,
+      sellValueEgp: totalSellValue,
+      potentialMarginEgp: money(totalSellValue - totalValue),
+    },
+    byBranch: [...branches.values()].sort((a, b) => b.valueEgp - a.valueEgp),
+    lowStock: lowStock.sort((a, b) => a.available - b.available).slice(0, 100),
+  });
+};
+
+/* ========================= تحويل بين الفروع ========================= */
 export const createStockTransfer = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ctx = getTenantContext();
@@ -579,6 +798,7 @@ export const createStockTransfer = async (req: Request, res: Response) => {
   };
 
   if (fromBranchId === toBranchId) throw ApiError.badRequest('لا يمكن التحويل لنفس الفرع');
+  requireBranchAccess(req, fromBranchId);
 
   const transfer = await withUniqueRetry(nextTransferNumber, (transferNumber) =>
     StockTransferModel.create({
@@ -610,7 +830,8 @@ export const listStockTransfers = async (req: Request, res: Response) => {
   const query = req.query as Record<string, unknown>;
   const filter: Record<string, unknown> = {};
   if (query.status) filter.status = query.status;
-  if (query.branchId) filter.$or = [{ fromBranchId: query.branchId }, { toBranchId: query.branchId }];
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.$or = [{ fromBranchId: scopedBranch }, { toBranchId: scopedBranch }];
 
   const [items, total] = await Promise.all([
     StockTransferModel.find(filter)
@@ -633,6 +854,7 @@ export const sendStockTransfer = async (req: Request, res: Response) => {
 
   const transfer = await StockTransferModel.findById(req.params.id);
   if (!transfer) throw ApiError.notFound('التحويل غير موجود');
+  requireBranchAccess(req, transfer.fromBranchId);
   if (transfer.status !== 'requested' && transfer.status !== 'approved') {
     throw ApiError.businessRule('لا يمكن إرسال تحويل في حالته الحالية');
   }
@@ -676,6 +898,7 @@ export const receiveStockTransfer = async (req: Request, res: Response) => {
 
   const transfer = await StockTransferModel.findById(req.params.id);
   if (!transfer) throw ApiError.notFound('التحويل غير موجود');
+  requireBranchAccess(req, transfer.toBranchId);
   if (transfer.status !== 'in_transit') throw ApiError.businessRule('لا يمكن الاستلام قبل الإرسال');
 
   for (const line of transfer.lines) {

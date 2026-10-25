@@ -23,10 +23,23 @@ import {
   receiveStockTransfer,
   recordStockMovement,
   sendStockTransfer,
+  stockValuation,
   supplierPerformance,
   updatePart,
   updateSupplier,
 } from '../controllers/inventoryController.js';
+import {
+  cancelPurchaseOrder,
+  createPurchaseOrder,
+  getPurchaseOrder,
+  listPurchaseOrders,
+  orderPurchaseOrder,
+  payablesReport,
+  receivePurchaseOrder,
+  recordSupplierPayment,
+  updatePurchaseOrder,
+} from '../controllers/purchaseController.js';
+import { createStockCount, getStockCount, listStockCounts } from '../controllers/stockCountController.js';
 import {
   addLabor,
   addRepairPart,
@@ -60,6 +73,7 @@ import {
   createExpense,
   createInvoice,
   deleteExpense,
+  downloadInvoicePdf,
   financeSummary,
   getInvoice,
   listExpenses,
@@ -70,18 +84,40 @@ import {
   updateExpense,
   voidInvoice,
 } from '../controllers/financeController.js';
+import { closeShift, currentShift, getShift, listShifts, openShift } from '../controllers/shiftController.js';
 import {
+  cashierReport,
+  customerStatement,
+  profitLossReport,
+  receivablesAging,
+  supplierStatement,
+  vatReport,
+} from '../controllers/reportController.js';
+import {
+  activateSubscriptionHandler,
   availableTechnicians,
   branchPerformance,
+  changeSubscriptionPlan,
   createBranch,
+  createRenewalRequest,
   deactivateBranch,
   getOrganization,
   listBranches,
+  listPlanCatalog,
+  listRenewalRequests,
+  listSubscriptionPayments,
   listTechnicians,
   technicianPerformance,
   updateBranch,
   updateOrganization,
 } from '../controllers/organizationController.js';
+import {
+  downloadBackup,
+  exportOrganizationBackup,
+  listBackups,
+  restoreBackupFromFile,
+  runBackupNow,
+} from '../controllers/backupController.js';
 import {
   dashboard,
   faultAnalysis,
@@ -116,16 +152,19 @@ import {
   createPartSchema,
   createSupplierSchema,
   stockAdjustSchema,
+  stockCountSchema,
   transferStockSchema,
   updatePartSchema,
   updateRepairPartSchema,
   updateSupplierSchema,
 } from '../validators/orgValidators.js';
 import {
+  closeShiftSchema,
   createEstimateSchema,
   createExpenseSchema,
   createInvoiceSchema,
   decideEstimateSchema,
+  openShiftSchema,
   recordPaymentSchema,
   sendEstimateSchema,
   sendMessageSchema,
@@ -142,11 +181,23 @@ import {
   updateKnowledgeSchema,
 } from '../validators/qualityValidators.js';
 import {
+  activateSubscriptionSchema,
+  changePlanSchema,
   createBranchSchema,
+  createRenewalRequestSchema,
   updateBranchSchema,
   updateOrganizationSchema,
 } from '../validators/orgValidators.js';
+import {
+  cancelPurchaseOrderSchema,
+  createPurchaseOrderSchema,
+  receivePurchaseOrderSchema,
+  recordSupplierPaymentSchema,
+  updatePurchaseOrderSchema,
+} from '../validators/purchaseValidators.js';
 import { objectIdSchema } from '../validators/common.js';
+import platformRouter from './platformRoutes.js';
+import marketRouter from './marketRoutes.js';
 
 /* ------------------ مخططات التحقق الخاصة بهذا الملف ------------------ */
 
@@ -214,6 +265,10 @@ supplierRouter.delete('/:id', requirePermission('supplier:manage'), deleteSuppli
 
 export const inventoryRouter = Router();
 inventoryRouter.get('/stock', requirePermission('stock:read'), inventoryStock);
+inventoryRouter.get('/valuation', requirePermission('report:read'), stockValuation);
+inventoryRouter.get('/counts', requirePermission('stock:read'), listStockCounts);
+inventoryRouter.get('/counts/:id', requirePermission('stock:read'), getStockCount);
+inventoryRouter.post('/counts', requirePermission('stock:move'), validate(stockCountSchema), createStockCount);
 inventoryRouter.post('/movements', requirePermission('stock:move'), validate(stockMovementValidation), recordStockMovement);
 inventoryRouter.get('/movements', requirePermission('stock:read'), listStockMovements);
 inventoryRouter.post('/adjust', requirePermission('stock:move'), validate(stockAdjustSchema), adjustStock);
@@ -221,6 +276,20 @@ inventoryRouter.get('/transfers', requirePermission('stock:read'), listStockTran
 inventoryRouter.post('/transfers', requirePermission('stock:move'), validate(transferStockSchema), createStockTransfer);
 inventoryRouter.post('/transfers/:id/send', requirePermission('stock:move'), sendStockTransfer);
 inventoryRouter.post('/transfers/:id/receive', requirePermission('stock:move'), receiveStockTransfer);
+
+/* ------------------------- أوامر الشراء والموردون ------------------------- */
+export const purchaseRouter = Router();
+purchaseRouter.get('/', requirePermission('purchase:read'), listPurchaseOrders);
+purchaseRouter.get('/payables', requirePermission('purchase:read'), payablesReport);
+// سداد على الحساب أو على أمر شراء محدد — قبل مسارات /:id حتى لا تُلتقط كمعرّف
+purchaseRouter.post('/payments', requirePermission('supplier_payment:record'), validate(recordSupplierPaymentSchema), recordSupplierPayment);
+purchaseRouter.get('/:id', requirePermission('purchase:read'), getPurchaseOrder);
+purchaseRouter.post('/', requirePermission('purchase:manage'), validate(createPurchaseOrderSchema), createPurchaseOrder);
+purchaseRouter.patch('/:id', requirePermission('purchase:manage'), validate(updatePurchaseOrderSchema), updatePurchaseOrder);
+purchaseRouter.post('/:id/order', requirePermission('purchase:manage'), orderPurchaseOrder);
+purchaseRouter.post('/:id/receive', requirePermission('purchase:receive'), validate(receivePurchaseOrderSchema), receivePurchaseOrder);
+purchaseRouter.post('/:id/cancel', requirePermission('purchase:manage'), validate(cancelPurchaseOrderSchema), cancelPurchaseOrder);
+purchaseRouter.post('/:id/payments', requirePermission('supplier_payment:record'), validate(recordSupplierPaymentSchema), recordSupplierPayment);
 
 /* ---------------------------- الدراسات ---------------------------- */
 export const estimateRouter = Router();
@@ -234,7 +303,7 @@ estimateRouter.post('/:id/decide', requirePermission('estimate:approve'), valida
 /* -------------------------- الفحص والضمان -------------------------- */
 export const qcRouter = Router();
 qcRouter.get('/', requirePermission('qc:read'), listQualityChecks);
-qcRouter.get('/stats', requirePermission('report:read'), qualityStats);
+qcRouter.get('/stats', requirePermission('qc:read'), qualityStats);
 qcRouter.post('/', requirePermission('qc:perform'), validate(createQualityCheckSchema), createQualityCheck);
 qcRouter.get('/:id', requirePermission('qc:read'), getQualityCheck);
 qcRouter.post('/:id/submit', requirePermission('qc:perform'), validate(submitQualityCheckSchema), submitQualityCheck);
@@ -254,6 +323,7 @@ financeRouter.get('/summary', requirePermission('report:read'), financeSummary);
 financeRouter.get('/invoices', requirePermission('invoice:read'), listInvoices);
 financeRouter.post('/invoices', requirePermission('invoice:write'), validate(createInvoiceSchema), createInvoice);
 financeRouter.get('/invoices/:id', requirePermission('invoice:read'), getInvoice);
+financeRouter.get('/invoices/:id/pdf', requirePermission('invoice:read'), downloadInvoicePdf);
 financeRouter.post('/invoices/:id/void', requirePermission('invoice:write'), validate(voidInvoiceSchema), voidInvoice);
 financeRouter.get('/payments', requirePermission('payment:read'), listPayments);
 financeRouter.post('/payments', requirePermission('payment:record'), validate(recordPaymentSchema), recordPayment);
@@ -261,7 +331,23 @@ financeRouter.get('/expenses', requirePermission('expense:read'), listExpenses);
 financeRouter.post('/expenses', requirePermission('expense:manage'), validate(createExpenseSchema), createExpense);
 financeRouter.patch('/expenses/:id', requirePermission('expense:manage'), validate(updateExpenseSchema), updateExpense);
 financeRouter.delete('/expenses/:id', requirePermission('expense:manage'), deleteExpense);
+
+// الخزينة والورديات — الوردية المفتوحة تُربط بها كل الحركات النقدية تلقائيًا
+financeRouter.get('/shifts', requirePermission('shift:read'), listShifts);
+financeRouter.get('/shifts/current', requirePermission('shift:read'), currentShift);
+financeRouter.post('/shifts/open', requirePermission('shift:manage'), validate(openShiftSchema), openShift);
+financeRouter.get('/shifts/:id', requirePermission('shift:read'), getShift);
+financeRouter.post('/shifts/:id/close', requirePermission('shift:manage'), validate(closeShiftSchema), closeShift);
+
 financeRouter.post('/pos/sale', requirePermission('pos:operate'), validate(posSaleSchema), posSale);
+
+// التقارير المالية وكشوف الحسابات
+financeRouter.get('/reports/profit-loss', requirePermission('report:read'), profitLossReport);
+financeRouter.get('/reports/vat', requirePermission('report:read'), vatReport);
+financeRouter.get('/reports/aging', requirePermission('report:read'), receivablesAging);
+financeRouter.get('/reports/cashier', requirePermission('report:read'), cashierReport);
+financeRouter.get('/customers/:id/statement', requirePermission('payment:read'), customerStatement);
+financeRouter.get('/suppliers/:id/statement', requirePermission('purchase:read'), supplierStatement);
 
 /* ----------------------------- التحليلات ----------------------------- */
 export const analyticsRouter = Router();
@@ -279,6 +365,13 @@ analyticsRouter.get('/branches/performance', requirePermission('analytics:read')
 export const organizationRouter = Router();
 organizationRouter.get('/', requirePermission('org:read'), getOrganization);
 organizationRouter.patch('/', requirePermission('org:update'), validate(updateOrganizationSchema), updateOrganization);
+organizationRouter.get('/subscription/plans', requirePermission('org:read'), listPlanCatalog);
+organizationRouter.get('/subscription/payments', requirePermission('org:update'), listSubscriptionPayments);
+organizationRouter.get('/subscription/renewal-requests', requirePermission('org:update'), listRenewalRequests);
+organizationRouter.post('/subscription/renewal-requests', requirePermission('org:update'), validate(createRenewalRequestSchema), createRenewalRequest);
+organizationRouter.post('/subscription/change-plan', requirePermission('org:update'), validate(changePlanSchema), changeSubscriptionPlan);
+organizationRouter.post('/subscription/activate', requirePermission('org:update'), validate(activateSubscriptionSchema), activateSubscriptionHandler);
+organizationRouter.get('/backup/export', requirePermission('org:update'), exportOrganizationBackup);
 
 export const branchRouter = Router();
 branchRouter.get('/', requirePermission('branch:read'), listBranches);
@@ -338,6 +431,7 @@ export function registerRoutes(app: Application): void {
   api.use('/estimates', estimateRouter);
   api.use('/parts', partRouter);
   api.use('/suppliers', supplierRouter);
+  api.use('/purchases', purchaseRouter);
   api.use('/inventory', inventoryRouter);
   api.use('/quality-checks', qcRouter);
   api.use('/warranty', warrantyRouter);
@@ -349,6 +443,8 @@ export function registerRoutes(app: Application): void {
   api.use('/notifications', notificationRouter);
   api.use('/audit-logs', auditRouter);
   api.use('/knowledge', knowledgeRouter);
+  api.use('/market', marketRouter);
+  api.use('/platform', platformRouter);
 
   // فهرس نقاط النهاية للمطورين
   api.get('/meta/endpoints', (_req, res) => {
@@ -365,7 +461,8 @@ export function registerRoutes(app: Application): void {
           { name: 'العروض والموافقات', base: '/estimates' },
           { name: 'قطع الغيار', base: '/parts' },
           { name: 'الموردون', base: '/suppliers' },
-          { name: 'المخزون والتحويلات', base: '/inventory' },
+          { name: 'أوامر الشراء وسداد الموردين', base: '/purchases' },
+          { name: 'المخزون والتحويلات والجرد والتقييم', base: '/inventory' },
           { name: 'فحص الجودة', base: '/quality-checks' },
           { name: 'الضمان', base: '/warranty' },
           { name: 'الفواتير والمدفوعات والمصروفات ونقاط البيع', base: '/finance' },
@@ -376,7 +473,9 @@ export function registerRoutes(app: Application): void {
           { name: 'الإشعارات', base: '/notifications' },
           { name: 'سجل التدقيق', base: '/audit-logs' },
           { name: 'قاعدة المعرفة', base: '/knowledge' },
+          { name: 'ماركت بلس وبورصة الأسعار', base: '/market' },
           { name: 'بوابة تتبع العميل (عام)', base: '/public/track/:token' },
+          { name: 'إدارة المنصة (مدير المنصة)', base: '/platform' },
         ],
       },
     });

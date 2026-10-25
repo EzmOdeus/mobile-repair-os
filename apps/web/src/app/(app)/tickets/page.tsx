@@ -1,12 +1,14 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Filter, LayoutGrid, List, Plus, Search, Wrench, AlertTriangle, User } from 'lucide-react';
-import { api, errorMessage, fetcher, qs } from '@/lib/api';
+import { api, errorMessage, fetcher, isNetworkError, qs } from '@/lib/api';
 import { formatMoney, formatNumber, formatDateTime, timeAgo } from '@/lib/format';
+import { createClientRequestId, enqueueTicket } from '@/lib/offlineQueue';
+import { useOnlineStatus } from '@/lib/useOnlineStatus';
 import {
   KANBAN_COLUMNS,
   PRIORITIES,
@@ -69,7 +71,7 @@ export default function TicketsPage() {
   const [priorityFilter, setPriorityFilter] = useState('');
   const [openOnly, setOpenOnly] = useState(true);
   const [page, setPage] = useState(1);
-  const [createOpen, setCreateOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(searchParams.get('new') === '1');
   const [technicianFilter, setTechnicianFilter] = useState('');
 
   const listKey = `/tickets${qs({
@@ -407,6 +409,9 @@ export default function TicketsPage() {
           toast.success('تم إنشاء التذكرة بنجاح');
           router.push(`/tickets/${ticketId}`);
         }}
+        onQueued={() => {
+          toast.info('حُفظت التذكرة على هذا الجهاز — ستُرسل تلقائيًا عند عودة الاتصال');
+        }}
       />
     </div>
   );
@@ -424,12 +429,16 @@ function CreateTicketModal({
   open,
   onClose,
   onCreated,
+  onQueued,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: (ticketId: string) => void;
+  onQueued: () => void;
 }) {
   const toast = useToast();
+  const online = useOnlineStatus();
+  const { activeBranchId } = useAuth();
   const [step, setStep] = useState<'customer' | 'device' | 'intake'>('customer');
   const [phone, setPhone] = useState('');
   const [lookup, setLookup] = useState<CustomerLookup | null>(null);
@@ -461,6 +470,14 @@ function CreateTicketModal({
   const [useNewDevice, setUseNewDevice] = useState(false);
   const [deviceError, setDeviceError] = useState<string | null>(null);
   const [customerError, setCustomerError] = useState<string | null>(null);
+
+  // فتح النموذج بدون اتصال: لا يمكن البحث برقم الهاتف، فننتقل مباشرة لإدخال عميل وجهاز جديدين
+  useEffect(() => {
+    if (open && !online && !lookup) {
+      setUseNewCustomer(true);
+      setUseNewDevice(true);
+    }
+  }, [open, online, lookup]);
 
   /** هل للعميل أجهزة مسجلة فعلًا؟ (يرفع أخطاء النوع مع مصفوفة قد تكون undefined) */
   const registeredDevices = lookup?.devices ?? [];
@@ -515,6 +532,10 @@ function CreateTicketModal({
   };
 
   const doLookup = async () => {
+    if (!online) {
+      setCustomerError('البحث عن عميل مسجل يحتاج اتصالًا — أدخل بيانات العميل يدويًا بالأسفل');
+      return;
+    }
     if (!phone.trim()) {
       setCustomerError('اكتب رقم الهاتف أولًا');
       return;
@@ -612,51 +633,70 @@ function CreateTicketModal({
       return;
     }
 
+    const clientRequestId = createClientRequestId();
+    const payload: Record<string, unknown> = {
+      clientRequestId,
+      priority: intake.priority,
+      source: 'walk_in',
+      intake: {
+        complaint: intake.complaint,
+        complaintCategory: intake.complaintCategory,
+        accessories: intake.accessories,
+        customerAcknowledged: intake.customerAcknowledged,
+        dataLossDisclaimerAccepted: intake.dataLossDisclaimerAccepted,
+        devicePasswordProvided: intake.devicePasswordProvided,
+        estimatedDeliveryAt: new Date(Date.now() + intake.estimatedDays * 86_400_000).toISOString(),
+      },
+    };
+
+    if (useNewCustomer) {
+      payload.newCustomer = {
+        fullName: customerForm.fullName,
+        phone: customerForm.phone,
+        companyName: customerForm.companyName,
+        type: customerForm.companyName ? 'company' : 'individual',
+      };
+    } else {
+      payload.customerId = selectedCustomerId;
+    }
+
+    if (useNewDevice || !hasRegisteredDevices) {
+      payload.newDevice = {
+        brand: deviceForm.brand,
+        model: deviceForm.model,
+        color: deviceForm.color,
+        storage: deviceForm.storage,
+        imei: deviceForm.imei,
+        conditionOnIntake: deviceForm.conditionOnIntake,
+      };
+    } else {
+      payload.deviceId = selectedDeviceId;
+    }
+
     setIsSubmitting(true);
     try {
-      const payload: Record<string, unknown> = {
-        priority: intake.priority,
-        source: 'walk_in',
-        intake: {
-          complaint: intake.complaint,
-          complaintCategory: intake.complaintCategory,
-          accessories: intake.accessories,
-          customerAcknowledged: intake.customerAcknowledged,
-          dataLossDisclaimerAccepted: intake.dataLossDisclaimerAccepted,
-          devicePasswordProvided: intake.devicePasswordProvided,
-          estimatedDeliveryAt: new Date(Date.now() + intake.estimatedDays * 86_400_000).toISOString(),
-        },
-      };
-
-      if (useNewCustomer) {
-        payload.newCustomer = {
-          fullName: customerForm.fullName,
-          phone: customerForm.phone,
-          companyName: customerForm.companyName,
-          type: customerForm.companyName ? 'company' : 'individual',
-        };
-      } else {
-        payload.customerId = selectedCustomerId;
-      }
-
-      if (useNewDevice || !hasRegisteredDevices) {
-        payload.newDevice = {
-          brand: deviceForm.brand,
-          model: deviceForm.model,
-          color: deviceForm.color,
-          storage: deviceForm.storage,
-          imei: deviceForm.imei,
-          conditionOnIntake: deviceForm.conditionOnIntake,
-        };
-      } else {
-        payload.deviceId = selectedDeviceId;
+      if (!online) {
+        enqueueTicket(payload, activeBranchId);
+        close();
+        onQueued();
+        return;
       }
 
       const created = await api.post<{ ticket: { _id: string } }>('/tickets', payload);
       onCreated(created.ticket._id);
       close();
     } catch (err) {
-      toast.error(errorMessage(err));
+      if (isNetworkError(err)) {
+        try {
+          enqueueTicket(payload, activeBranchId);
+          close();
+          onQueued();
+        } catch (queueError) {
+          toast.error(errorMessage(queueError));
+        }
+      } else {
+        toast.error(errorMessage(err));
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -684,7 +724,7 @@ function CreateTicketModal({
             </button>
           ) : (
             <button type="button" className="btn-primary" onClick={submit} disabled={isSubmitting}>
-              {isSubmitting ? 'جارٍ الحفظ…' : 'إنشاء التذكرة'}
+              {isSubmitting ? 'جارٍ الحفظ…' : online ? 'إنشاء التذكرة' : 'حفظ التذكرة محليًا'}
             </button>
           )}
         </>
@@ -726,6 +766,13 @@ function CreateTicketModal({
 
       {step === 'customer' ? (
         <div className="space-y-4">
+          {!online ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-800">
+              لا يوجد اتصال بالإنترنت. أدخل بيانات العميل والجهاز يدويًا، وستُحفظ التذكرة على هذا الجهاز
+              وتُرسل تلقائيًا عند عودة الاتصال.
+            </div>
+          ) : null}
+
           <div className="flex gap-2">
             <input
               className="input"
@@ -733,8 +780,14 @@ function CreateTicketModal({
               value={phone}
               onChange={(e) => setPhone(e.target.value)}
               dir="ltr"
+              disabled={!online}
             />
-            <button type="button" className="btn-primary shrink-0" onClick={doLookup} disabled={isLookingUp}>
+            <button
+              type="button"
+              className="btn-primary shrink-0"
+              onClick={doLookup}
+              disabled={isLookingUp || !online}
+            >
               {isLookingUp ? '…' : 'بحث'}
             </button>
           </div>
@@ -1094,6 +1147,11 @@ function CreateTicketModal({
             <p className="text-[11px] text-ink-500">
               يمكن رفع صور الاستلام وتوقيع العميل من صفحة التذكرة بعد الإنشاء.
             </p>
+            {!online ? (
+              <p className="rounded-md bg-amber-50 px-2 py-1.5 text-[11px] font-medium text-amber-800">
+                هذه التذكرة ستُحفظ محليًا الآن، وتُرسل للخادم تلقائيًا عند عودة الاتصال.
+              </p>
+            ) : null}
           </div>
         </div>
       ) : null}

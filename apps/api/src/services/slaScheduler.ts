@@ -18,6 +18,20 @@ import { scanSlaBreaches } from './workflowService.js';
  * تعمل تحت سياق النظام لأنها تعبر كل المؤسسات؛ كل كتابة تُفلتر بمعرّف مؤسستها.
  */
 export async function runSlaScanOnce(): Promise<number> {
+  // قفل تشغيل: دورة متداخلة (يدوي + دوري) قد تُنشئ إشعارات مكررة لأن استعلام
+  // المرشحين يسبق تحديث راية التجاوز — نتجاهل الدورة إن سبقها تشغيل غير منتهٍ.
+  if (running) return 0;
+  running = true;
+  try {
+    return await runSlaScanInner();
+  } finally {
+    running = false;
+  }
+}
+
+let running = false;
+
+async function runSlaScanInner(): Promise<number> {
   return runAsSystem(async () => {
     const organizations = await OrganizationModel.find({ isActive: { $ne: false } })
       .select('_id name')

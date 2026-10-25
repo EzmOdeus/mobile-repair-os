@@ -10,10 +10,44 @@ import { useAuth, ROLE_LABELS_AR } from '@/lib/auth';
 import { initials } from '@/lib/format';
 import { fetcher } from '@/lib/api';
 import { NAV_GROUPS, canAccessRoute } from '@/lib/routePermissions';
+import { OfflineStatus } from '@/components/OfflineStatus';
+import { InstallAppButton } from '@/components/InstallAppButton';
+
+/** مبدّل الفرع: يغيّر نطاق كل شاشات النظام فورًا */
+function BranchSwitcher({ compact = false }: { compact?: boolean }) {
+  const { user, availableBranches, activeBranchId, setActiveBranch } = useAuth();
+  if (!user || availableBranches.length === 0) return null;
+
+  const orgWide = ['owner', 'admin', 'accountant', 'viewer'].includes(user.role);
+
+  return (
+    <label
+      className={clsx(
+        'flex items-center gap-2 rounded-lg border border-ink-200 bg-white px-2.5 py-1.5 text-xs text-ink-700',
+        compact ? 'max-w-[190px]' : 'w-full',
+      )}
+      title="الفرع النشط — يحدد نطاق البيانات والعمليات"
+    >
+      <Building2 size={14} className="shrink-0 text-ink-400" />
+      <select
+        value={activeBranchId ?? ''}
+        onChange={(event) => setActiveBranch(event.target.value || null)}
+        className="min-w-0 flex-1 cursor-pointer bg-transparent font-medium outline-none"
+      >
+        {orgWide ? <option value="">كل الفروع</option> : null}
+        {availableBranches.map((branch) => (
+          <option key={branch.id} value={branch.id}>
+            {branch.name} ({branch.code})
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const { user, organization, branches, logout, hasPermission } = useAuth();
+  const { user, organization, logout, hasPermission } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   // عدّاد الإشعارات غير المقروءة — يتحدث كل دقيقة دون إثقال الصفحة
@@ -102,9 +136,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <div className="ms-auto">{bell}</div>
         </div>
 
+        <div className="border-b border-ink-200 px-3 py-2.5">
+          <BranchSwitcher />
+        </div>
+
         {nav}
 
         <div className="border-t border-ink-200 p-3">
+          <div className="mb-2">
+            <InstallAppButton />
+          </div>
           <div className="mb-2 flex items-center gap-2.5 rounded-lg bg-ink-50 px-2.5 py-2">
             <span className="flex h-8 w-8 items-center justify-center rounded-full bg-brand-100 text-xs font-bold text-brand-800">
               {user ? initials(user.fullName) : '—'}
@@ -142,6 +183,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </div>
             {nav}
             <div className="border-t border-ink-200 p-3">
+              <div className="mb-2">
+                <InstallAppButton />
+              </div>
               <button type="button" onClick={logout} className="btn-ghost w-full justify-start text-xs">
                 <LogOut size={15} />
                 تسجيل الخروج
@@ -152,8 +196,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       ) : null}
 
       {/* المحتوى */}
-      <div className="lg:pr-64">
-        <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-ink-200 bg-white/95 px-4 py-3 backdrop-blur lg:hidden">
+      <div className="lg:pr-64">        <header className="sticky top-0 z-30 flex items-center justify-between gap-3 border-b border-ink-200 bg-white/95 px-4 py-3 backdrop-blur lg:hidden">
           <button type="button" onClick={() => setMobileOpen(true)} className="btn-ghost px-2">
             <Menu size={18} />
           </button>
@@ -163,21 +206,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             </span>
             <span className="text-sm font-bold text-ink-900">Mobile Repair OS</span>
           </div>
-          {bell}
+          <div className="flex items-center gap-1.5">
+            <BranchSwitcher compact />
+            {bell}
+          </div>
         </header>
 
-        <main className="mx-auto max-w-7xl px-4 py-5 sm:px-6">{children}</main>
+        <main className="mx-auto max-w-7xl px-4 py-5 sm:px-6">
+          <OfflineStatus />
+          {children}
+        </main>
       </div>
-
-      {/* شريط الفروع على الشاشات الكبيرة */}
-      {branches.length > 1 ? (
-        <div className="pointer-events-none fixed bottom-4 left-4 z-20 hidden lg:block">
-          <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-ink-200 bg-white px-3 py-1.5 text-[11px] text-ink-600 shadow-card">
-            <Building2 size={13} className="text-ink-400" />
-            {branches.length} فروع
-          </div>
-        </div>
-      ) : null}
     </div>
   );
 }

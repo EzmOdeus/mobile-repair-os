@@ -6,31 +6,67 @@ import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yaml';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { corsOptions } from './config/cors.js';
-import { dbState } from './config/database.js';
+import { connectDatabase, dbState } from './config/database.js';
 import { requestIdMiddleware, authenticate } from './middleware/auth.js';
+import { subscriptionWriteGuard } from './middleware/subscriptionGuard.js';
 import { uploadAccessGate, uploadAuthorization, serveUploadedFile } from './middleware/uploadAuth.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import { auditMiddleware } from './services/auditService.js';
 import { registerRoutes } from './routes/index.js';
-import { resolveUploadDir } from './services/storageService.js';
+import cronRouter from './routes/cronRoutes.js';
+import { registerAllModels } from './models/register.js';
+import { resolveUploadDir } from './services/storageDrivers.js';
 
 export function createApp(): Application {
+  // تسجيل الموديلات قبل بناء المسارات يضمن جاهزيتها لأي populate
+  registerAllModels();
   const app = express();
 
   // توثيق OpenAPI متاح عبر Swagger UI دون الحاجة إلى تسجيل الدخول.
-  const openApiPath = path.resolve(process.cwd(), 'docs/openapi.yaml');
-  const openApiDocument = YAML.parse(fs.readFileSync(openApiPath, 'utf8'));
+  // في بيئة Serverless قد لا يكون الملف مضمّنًا في الحزمة، فنستخدم مستندًا بسيطًا بدلًا من الانهيار.
+  // نبحث أولًا بجوار جذر المستودع (حتى يعمل التشغيل من داخل مجلد الـworkspace)، ثم في cwd.
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const openApiPath = [
+    path.resolve(moduleDir, '../../../docs/openapi.yaml'),
+    path.resolve(process.cwd(), 'docs/openapi.yaml'),
+    path.resolve(process.cwd(), 'apps/api/docs/openapi.yaml'),
+  ].find((candidate) => fs.existsSync(candidate)) ?? path.resolve(process.cwd(), 'docs/openapi.yaml');
+  let openApiDocument: Record<string, unknown>;
+  try {
+    openApiDocument = YAML.parse(fs.readFileSync(openApiPath, 'utf8'));
+  } catch {
+    openApiDocument = {
+      openapi: '3.0.3',
+      info: { title: 'Mobile Repair OS Egypt API', version: '1.0.0' },
+      paths: {},
+    };
+    logger.warn({ openApiPath }, 'تعذر قراءة docs/openapi.yaml - استخدام مستند فارغ');
+  }
   openApiDocument.servers = [{ url: `${env.PUBLIC_API_URL}${env.API_PREFIX}`, description: 'API server' }];
   app.get('/docs/openapi.json', (_req, res) => res.json(openApiDocument));
-  app.use('/docs', swaggerUi.serve, swaggerUi.setup(openApiDocument, {
+
+  // نفضّل نسخة الأصول المنسوخة إلى dist (تُضمَّن في حزمة Vercel)؛ وإلا نستخدم حزمة swagger-ui-dist محليًا.
+  const swaggerAssetsDir = [
+    path.resolve(moduleDir, 'swagger-ui'),
+    path.resolve(process.cwd(), 'dist/swagger-ui'),
+    path.resolve(process.cwd(), 'apps/api/dist/swagger-ui'),
+  ].find((candidate) => fs.existsSync(path.join(candidate, 'swagger-ui.css')));
+
+  const swaggerSetup = swaggerUi.setup(openApiDocument, {
     customSiteTitle: 'Mobile Repair OS API Docs',
     swaggerOptions: { persistAuthorization: true },
-  }));
+  });
+  if (swaggerAssetsDir) {
+    app.use('/docs', swaggerUi.serve[0], express.static(swaggerAssetsDir, { index: false, redirect: false }), swaggerSetup);
+  } else {
+    app.use('/docs', swaggerUi.serve, swaggerSetup);
+  }
 
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
@@ -91,6 +127,28 @@ export function createApp(): Application {
   app.get('/health', health);
   app.get(`${env.API_PREFIX}/health`, health);
 
+  // --- اتصال قاعدة البيانات عند أول طلب (بيئة Serverless) ---
+  // في السيرفر الدائم يستبق server.ts الاتصال فلا يفعل هذا الوسيط شيئًا.
+  // الوصول لقاعدة البيانات مسموح للـ /health بلا اتصال ليعرض الحالة 'degraded'.
+  let dbPromise: Promise<unknown> | null = null;
+  app.use((_req, _res, next) => {
+    if (dbState() === 'connected') return next();
+    if (!dbPromise) {
+      dbPromise = connectDatabase();
+      // عند الفشل اسمح بمحاولة جديدة في الطلب التالي
+      dbPromise.catch(() => {
+        dbPromise = null;
+      });
+    }
+    return void dbPromise.then(
+      () => next(),
+      (err) => next(err),
+    );
+  });
+
+  // --- مهام دورية خارجية (Vercel Cron) — قبل مصادقة المستخدمين ---
+  app.use(`${env.API_PREFIX}/internal/cron`, cronRouter);
+
   /**
    * --- الملفات المرفوعة ---
    *
@@ -101,8 +159,10 @@ export function createApp(): Application {
    * بأنفسنا. البوابة قبل `authenticate` لأن وسوم `<img>` لا تحمل رأس Authorization
    * فتعتمد على التوقيع المرفق بالرابط.
    */
-  const uploadDir = resolveUploadDir();
-  if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+  if (env.STORAGE_DRIVER === 'local') {
+    const uploadDir = resolveUploadDir();
+    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+  }
   app.use('/uploads', uploadAccessGate, uploadAuthorization('evidence:read'), serveUploadedFile);
 
   // --- مصادقة على مستوى التطبيق (المسارات العامة تُعلن نفسها) ---
@@ -112,7 +172,17 @@ export function createApp(): Application {
     const path = rawPath.startsWith(env.API_PREFIX) ? rawPath.slice(env.API_PREFIX.length) : rawPath;
     const normalized = path.startsWith('/') ? path : `/${path}`;
 
-    const publicPrefixes = ['/auth/login', '/auth/refresh', '/auth/register', '/public', '/health', '/meta'];
+    const publicPrefixes = [
+      '/auth/login',
+      '/auth/2fa/verify',
+      '/auth/refresh',
+      '/auth/register',
+      '/auth/forgot-password',
+      '/auth/reset-password',
+      '/public',
+      '/health',
+      '/meta',
+    ];
     const isPublic = publicPrefixes.some(
       (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`),
     );
@@ -121,6 +191,8 @@ export function createApp(): Application {
     }
     return authenticate(req, res, next);
   });
+
+  app.use(`${env.API_PREFIX}`, subscriptionWriteGuard);
 
   app.use(`${env.API_PREFIX}`, auditMiddleware);
 
@@ -149,3 +221,9 @@ export function createApp(): Application {
 export function resolveStaticPath(...segments: string[]): string {
   return path.join(process.cwd(), ...segments);
 }
+
+/**
+ * نسخة افتراضية لبيئات Serverless: Vercel يستورد التطبيق مباشرة من `dist/app.js`
+ * ويتوقع تصديرًا افتراضيًا جاهزًا، بدلًا من استدعاء `createApp()` بنفسه.
+ */
+export default createApp();

@@ -3,6 +3,8 @@ import { tenantPlugin } from './plugins/tenantPlugin.js';
 
 export const STOCK_MOVEMENT_TYPES = [
   'purchase_in',
+  'purchase_order',
+  'purchase_cancel',
   'sale_out',
   'repair_consume',
   'repair_return',
@@ -21,6 +23,8 @@ export type StockMovementType = (typeof STOCK_MOVEMENT_TYPES)[number];
 
 export const STOCK_MOVEMENT_LABELS_AR: Record<StockMovementType, string> = {
   purchase_in: 'توريد مشتريات',
+  purchase_order: 'طلب شراء (وارد متوقع)',
+  purchase_cancel: 'إلغاء توريد متوقع',
   sale_out: 'بيع',
   repair_consume: 'استهلاك في إصلاح',
   repair_return: 'إرجاع من إصلاح',
@@ -77,6 +81,9 @@ const stockMovementSchema = new Schema(
 
     reason: { type: String, default: '' },
     reference: { type: String, default: '' },
+    /** عكس حركة بيع لم تكتمل: تُعلَّم الأصلية حتى لا تُعكس مرتين */
+    reversedAt: { type: Date, default: null },
+    reversalMovementId: { type: Schema.Types.ObjectId, ref: 'StockMovement', default: null },
     actorId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     actorName: { type: String, default: '' },
     occurredAt: { type: Date, default: Date.now, index: true },

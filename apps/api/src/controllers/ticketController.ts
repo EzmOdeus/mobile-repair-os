@@ -19,7 +19,7 @@ import { OrganizationModel } from '../models/Organization.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok, paginated } from '../utils/asyncHandler.js';
 import { parseCsv, parseDateRange, parseListQuery, parseSort, regexSearch } from '../utils/queryHelpers.js';
-import { getAuth } from '../middleware/auth.js';
+import { branchFilter, getAuth, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { assertTicketLimit } from '../services/planService.js';
@@ -48,13 +48,46 @@ import { saveFile, publicFileUrl } from '../services/storageService.js';
 import { addHours, diffMinutes } from '../utils/dates.js';
 import type { CreateTicketInput, DiagnosisInput } from '../validators/coreValidators.js';
 
-const MANAGER_ROLES = ['owner', 'admin', 'manager'];
 
 /** الفني لا يرى في القوائم إلا التذاكر المسندة إليه شخصيًا */
 function technicianScopeFilter(req: Request): Record<string, unknown> {
   const auth = getAuth(req);
   if (auth.role === 'technician') return { assignedTechnicianId: new Types.ObjectId(auth.userId) };
   return {};
+}
+
+/**
+ * يتحقق أن المستخدم فني نشط يخدم فرع التذكرة ولديه سعة مهام.
+ * الإسناد يجب أن يمر من هنا في الإنشاء والتعديل معًا حتى لا يلتف عميل API
+ * على قيود شاشة الإسناد (فرع آخر/سعة ممتلئة/حساب ليس فنيًا).
+ */
+async function resolveAssignableTechnician(
+  organizationId: Types.ObjectId,
+  technicianId: string,
+  branchId: Types.ObjectId,
+): Promise<Types.ObjectId> {
+  const technician = await UserModel.findOne({ _id: technicianId, organizationId })
+    .select('role isActive technicianProfile branchIds')
+    .lean();
+  if (!technician) throw ApiError.notFound('الفني غير موجود');
+  if (technician.role !== 'technician' && !technician.technicianProfile?.isTechnician) {
+    throw ApiError.businessRule('المستخدم المحدد ليس فنيًا');
+  }
+  if (!technician.isActive) throw ApiError.businessRule('الفني غير نشط');
+  if (!(technician.branchIds ?? []).some((id) => String(id) === String(branchId))) {
+    throw ApiError.businessRule('الفني لا يخدم فرع التذكرة');
+  }
+
+  const maxJobs = technician.technicianProfile?.maxActiveJobs ?? 5;
+  const currentJobs = await RepairTicketModel.countDocuments({
+    organizationId,
+    assignedTechnicianId: technician._id,
+    status: { $in: ACTIVE_REPAIR_STATUSES },
+  });
+  if (currentJobs >= maxJobs) {
+    throw ApiError.businessRule(`الفني وصل للحد الأقصى من المهام النشطة (${maxJobs})`, { currentJobs, maxJobs });
+  }
+  return technician._id as Types.ObjectId;
 }
 
 const SORTABLE = ['createdAt', 'updatedAt', 'priority', 'sla.dueAt', 'cost.totalFinalEgp', 'ticketNumber'];
@@ -90,6 +123,9 @@ function buildTicketFilter(req: Request): Record<string, unknown> {
     filter.assignedTechnicianId = query.technicianId === 'unassigned' ? null : query.technicianId;
   }
   if (query.slaBreached !== undefined) filter['sla.breached'] = query.slaBreached === 'true';
+
+  const branchId = branchFilter(req);
+  if (branchId) filter.branchId = branchId;
 
   const range = parseDateRange(query.from, query.to);
   if (range) filter.createdAt = range;
@@ -160,7 +196,8 @@ export const ticketBoard = async (req: Request, res: Response) => {
     organizationId,
     status: { $in: ACTIVE_REPAIR_STATUSES },
   };
-  if (query.branchId) filter.branchId = query.branchId;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
   if (query.technicianId) filter.assignedTechnicianId = query.technicianId;
 
   // عزل الفني: لا يرى اللوحة إلا بتذاكره هو
@@ -235,6 +272,7 @@ export const getTicket = async (req: Request, res: Response) => {
 
   const ticket = await RepairTicketModel.findOne({ _id: String(req.params.id), organizationId }).lean();
   if (!ticket) throw ApiError.notFound('التذكرة غير موجودة');
+  requireBranchAccess(req, ticket.branchId);
 
   // عزل الفني: لا يفتح تفاصيل تذكرة غير مسندة إليه
   const auth = getAuth(req);
@@ -345,6 +383,22 @@ export const createTicket = async (req: Request, res: Response) => {
   const organizationId = ctx!.organizationId;
   const body = req.body as CreateTicketInput;
 
+  // إعادة إرسال من طابور عدم الاتصال: نُرجع نفس التذكرة بدل إنشاء نسخة ثانية
+  if (body.clientRequestId) {
+    const existing = await RepairTicketModel.findOne({
+      organizationId,
+      clientRequestId: body.clientRequestId,
+      createdBy: new Types.ObjectId(auth.userId),
+    }).lean();
+    if (existing) {
+      return ok(res, {
+        ticket: { ...existing, statusLabel: statusLabel(existing.status) },
+        trackingUrl: `/track/${existing.trackingToken}`,
+        idempotentReplay: true,
+      });
+    }
+  }
+
   // فرض حد التذاكر الشهري للباقة قبل أي كتابة
   await assertTicketLimit(organizationId);
 
@@ -396,6 +450,10 @@ export const createTicket = async (req: Request, res: Response) => {
     throw ApiError.businessRule('الجهاز المحدد لا يتبع العميل المحدد');
   }
 
+  const assignedTechnicianId = body.assignedTechnicianId
+    ? await resolveAssignableTechnician(organizationId, body.assignedTechnicianId, ctx!.branchId!)
+    : null;
+
   const priority = (body.priority ?? 'normal') as TicketPriority;
   const now = new Date();
   const organization = await OrganizationModel.findById(organizationId).select('settings').lean();
@@ -409,49 +467,73 @@ export const createTicket = async (req: Request, res: Response) => {
    * (بعد إعادة تهيئة عدّاد أو استعادة نسخة احتياطية) يعيد المحاولة برقم جديد
    * بدل إفشال عملية الاستقبال على الموظف بـ409.
    */
-  const ticket = await withUniqueRetry(
-    () => nextTicketNumber(),
-    (ticketNumber) =>
-      RepairTicketModel.create({
+  const createTicketRecord = async () =>
+    withUniqueRetry(
+      () => nextTicketNumber(),
+      (ticketNumber) =>
+        RepairTicketModel.create({
+          organizationId,
+          branchId: ctx!.branchId,
+          ticketNumber,
+          clientRequestId: body.clientRequestId ?? null,
+          trackingToken,
+          customerId,
+          deviceId,
+          status: 'received',
+          priority,
+          source: body.source ?? 'walk_in',
+          assignedTechnicianId,
+          assignedAt: assignedTechnicianId ? now : null,
+          assignedBy: assignedTechnicianId ? new Types.ObjectId(auth.userId) : null,
+          promisedAt: body.promisedAt ?? null,
+          tags: body.tags ?? [],
+          internalNotes: body.internalNotes ?? '',
+          intake: {
+            receivedAt: now,
+            receivedBy: new Types.ObjectId(auth.userId),
+            complaint: body.intake.complaint,
+            complaintCategory: body.intake.complaintCategory ?? '',
+            visualCondition: body.intake.visualCondition ?? {},
+            accessories: body.intake.accessories ?? [],
+            customerAcknowledged: body.intake.customerAcknowledged ?? false,
+            acknowledgedAt: body.intake.customerAcknowledged ? now : null,
+            dataLossDisclaimerAccepted: body.intake.dataLossDisclaimerAccepted ?? false,
+            devicePasswordProvided: body.intake.devicePasswordProvided ?? false,
+            initialTests,
+            estimatedDeliveryAt: body.intake.estimatedDeliveryAt ?? dueAt,
+            internalNotes: body.intake.internalNotes ?? '',
+          },
+          sla: { dueAt, breached: false, pausedAt: null, pausedMinutes: 0 },
+          warranty: {
+            policyDays: organization?.settings?.defaultWarrantyDays ?? 30,
+            partsDays: organization?.settings?.partsWarrantyDays ?? 90,
+            laborDays: organization?.settings?.laborWarrantyDays ?? 14,
+          },
+          createdBy: new Types.ObjectId(auth.userId),
+        }),
+    );
+
+  let ticket: Awaited<ReturnType<typeof createTicketRecord>>;
+  try {
+    ticket = await createTicketRecord();
+  } catch (error) {
+    // سباق نادر: طلبان بنفس المفتاح وصلًا معًا — الفهرس الفريد يمنع الازدواج
+    if (body.clientRequestId && (error as { code?: number }).code === 11000) {
+      const existing = await RepairTicketModel.findOne({
         organizationId,
-        branchId: ctx!.branchId,
-        ticketNumber,
-        trackingToken,
-        customerId,
-        deviceId,
-        status: 'received',
-        priority,
-        source: body.source ?? 'walk_in',
-        assignedTechnicianId: body.assignedTechnicianId ? new Types.ObjectId(body.assignedTechnicianId) : null,
-        assignedAt: body.assignedTechnicianId ? now : null,
-        assignedBy: body.assignedTechnicianId ? new Types.ObjectId(auth.userId) : null,
-        promisedAt: body.promisedAt ?? null,
-        tags: body.tags ?? [],
-        internalNotes: body.internalNotes ?? '',
-        intake: {
-          receivedAt: now,
-          receivedBy: new Types.ObjectId(auth.userId),
-          complaint: body.intake.complaint,
-          complaintCategory: body.intake.complaintCategory ?? '',
-          visualCondition: body.intake.visualCondition ?? {},
-          accessories: body.intake.accessories ?? [],
-          customerAcknowledged: body.intake.customerAcknowledged ?? false,
-          acknowledgedAt: body.intake.customerAcknowledged ? now : null,
-          dataLossDisclaimerAccepted: body.intake.dataLossDisclaimerAccepted ?? false,
-          devicePasswordProvided: body.intake.devicePasswordProvided ?? false,
-          initialTests,
-          estimatedDeliveryAt: body.intake.estimatedDeliveryAt ?? dueAt,
-          internalNotes: body.intake.internalNotes ?? '',
-        },
-        sla: { dueAt, breached: false, pausedAt: null, pausedMinutes: 0 },
-        warranty: {
-          policyDays: organization?.settings?.defaultWarrantyDays ?? 30,
-          partsDays: organization?.settings?.partsWarrantyDays ?? 90,
-          laborDays: organization?.settings?.laborWarrantyDays ?? 14,
-        },
+        clientRequestId: body.clientRequestId,
         createdBy: new Types.ObjectId(auth.userId),
-      }),
-  );
+      }).lean();
+      if (existing) {
+        return ok(res, {
+          ticket: { ...existing, statusLabel: statusLabel(existing.status) },
+          trackingUrl: `/track/${existing.trackingToken}`,
+          idempotentReplay: true,
+        });
+      }
+    }
+    throw error;
+  }
 
   await recordTimelineEvent({
     ticket,
@@ -501,6 +583,7 @@ export const createTicket = async (req: Request, res: Response) => {
 
 export const updateTicket = async (req: Request, res: Response) => {
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const body = req.body as Record<string, unknown>;
 
   for (const field of [
@@ -544,6 +627,7 @@ export const updateTicket = async (req: Request, res: Response) => {
 export const changeTicketStatus = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const body = req.body as {
     status: RepairStatus;
     note?: string;
@@ -555,7 +639,8 @@ export const changeTicketStatus = async (req: Request, res: Response) => {
   assertTechnicianOwnership(
     ticket,
     { userId: auth.userId, fullName: auth.fullName, role: auth.role },
-    MANAGER_ROLES.includes(auth.role),
+    // القيد يخص الفنيين فقط: بقية الأدوار المخوّلة بـticket:transition (استقبال/محاسب) تدير التذكرة كاملة
+    auth.role !== 'technician',
   );
 
   const updated = await transitionTicket(
@@ -582,24 +667,11 @@ export const assignTechnician = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ctx = getTenantContext();
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const body = req.body as { technicianId: string | null; note?: string };
 
   if (body.technicianId) {
-    const technician = await UserModel.findOne({ _id: body.technicianId, organizationId: ctx!.organizationId })
-      .select('fullName role isActive technicianProfile')
-      .lean();
-    if (!technician) throw ApiError.notFound('الفني غير موجود');
-    if (!technician.isActive) throw ApiError.businessRule('الفني غير نشط');
-
-    const maxJobs = technician.technicianProfile?.maxActiveJobs ?? 5;
-    const currentJobs = await RepairTicketModel.countDocuments({
-      organizationId: ctx!.organizationId,
-      assignedTechnicianId: technician._id,
-      status: { $in: ACTIVE_REPAIR_STATUSES },
-    });
-    if (currentJobs >= maxJobs) {
-      throw ApiError.businessRule(`الفني وصل للحد الأقصى من المهام النشطة (${maxJobs})`, { currentJobs, maxJobs });
-    }
+    await resolveAssignableTechnician(ctx!.organizationId, body.technicianId, ticket.branchId as Types.ObjectId);
   }
 
   ticket.assignedTechnicianId = body.technicianId ? new Types.ObjectId(body.technicianId) : null;
@@ -647,6 +719,7 @@ export const assignTechnician = async (req: Request, res: Response) => {
 export const saveDiagnosis = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -693,6 +766,7 @@ export const saveDiagnosis = async (req: Request, res: Response) => {
 export const addTicketNote = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const body = req.body as {
     body: string;
     visibility: 'internal' | 'customer';
@@ -730,6 +804,7 @@ export const addTicketNote = async (req: Request, res: Response) => {
 export const logWork = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const body = req.body as { action: 'start' | 'pause' | 'complete'; note?: string };
 
   const openLog = ticket.workLogs.find((log) => !log.endedAt);
@@ -826,6 +901,7 @@ export const myJobs = async (req: Request, res: Response) => {
 export const uploadTicketEvidence = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
 
   const files = (req.files ?? {}) as Record<string, Express.Multer.File[]>;
   const incoming = [
@@ -914,6 +990,7 @@ export const uploadTicketEvidence = async (req: Request, res: Response) => {
 /** الـTimeline الكامل (Chain of Custody) */
 export const getTicketTimeline = async (req: Request, res: Response) => {
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   const timeline = await RepairStatusHistoryModel.find({
     organizationId: ticket.organizationId,
     ticketId: ticket._id,

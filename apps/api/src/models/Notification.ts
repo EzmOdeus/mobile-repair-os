@@ -24,6 +24,15 @@ export const NOTIFICATION_TYPES = [
   'internal_assignment',
   'low_stock',
   'ticket_cancelled',
+  'subscription_expiring',
+  'subscription_expired',
+  'subscription_activated',
+  'subscription_renewal_rejected',
+  'market_offer_received',
+  'market_offer_accepted',
+  'market_offer_rejected',
+  'market_listing_approved',
+  'market_listing_rejected',
   'custom',
 ] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
@@ -48,6 +57,15 @@ export const NOTIFICATION_TYPE_LABELS_AR: Record<NotificationType, string> = {
   internal_assignment: 'تعيين مهمة لفني',
   low_stock: 'مخزون منخفض',
   ticket_cancelled: 'إلغاء الطلب',
+  subscription_expiring: 'اشتراك على وشك الانتهاء',
+  subscription_expired: 'انتهاء الاشتراك',
+  subscription_activated: 'تفعيل اشتراك',
+  subscription_renewal_rejected: 'رفض طلب تجديد',
+  market_offer_received: 'عرض شراء جديد',
+  market_offer_accepted: 'قبول عرضك',
+  market_offer_rejected: 'رفض عرضك',
+  market_listing_approved: 'اعتماد إعلانك',
+  market_listing_rejected: 'رفض إعلانك',
   custom: 'رسالة مخصصة',
 };
 
@@ -71,6 +89,9 @@ const notificationSchema = new Schema(
     deviceId: { type: Schema.Types.ObjectId, ref: 'Device', default: null },
     /** المستخدم المستهدف في الإشعارات الداخلية */
     userId: { type: Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+    /** مراجع ماركت بلس للانتقال المباشر من الإشعار */
+    listingId: { type: Schema.Types.ObjectId, ref: 'MarketListing', default: null, index: true },
+    offerId: { type: Schema.Types.ObjectId, ref: 'MarketOffer', default: null, index: true },
 
     /** القناة */
     toPhone: { type: String, default: '' },

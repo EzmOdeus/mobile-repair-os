@@ -1,0 +1,15 @@
+{
+  "name": "@mros/phone-doctor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Phone Doctor — أداة فحص USB شامل لأجهزة صيانة الموبايل (أندرويد + آيفون)",
+  "main": "main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test tests/",
+    "typecheck": "echo 'no typecheck for phone-doctor (plain js)'"
+  },
+  "devDependencies": {
+    "electron": "^45.0.0"
+  }
+}

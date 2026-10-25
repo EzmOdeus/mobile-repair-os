@@ -2,20 +2,35 @@ import type { Request, Response } from 'express';
 import { Types } from 'mongoose';
 import { OrganizationModel } from '../models/Organization.js';
 import { BranchModel } from '../models/Branch.js';
-import { UserModel } from '../models/User.js';
+import { UserModel, type UserDoc } from '../models/User.js';
 import { ApiError } from '../utils/ApiError.js';
 import { asyncHandler, created, ok } from '../utils/asyncHandler.js';
 import { slugifyWithSuffix } from '../utils/ids.js';
 import { permissionsForRole, type Permission, type Role } from '../constants/roles.js';
 import { normalizeEgyptPhone } from '../validators/common.js';
 import {
+  generatePasswordResetToken,
   hashToken,
   signAccessToken,
   signRefreshToken,
+  signTwoFactorChallenge,
   verifyRefreshToken,
+  verifyTwoFactorChallenge,
 } from '../services/tokenService.js';
+import {
+  buildOtpAuthUri,
+  buildTotpQrDataUrl,
+  decryptTwoFactorSecret,
+  encryptTwoFactorSecret,
+  generateRecoveryCodes,
+  generateTotpSecret,
+  hashRecoveryCode,
+  verifyTotp,
+} from '../services/twoFactorService.js';
+import { env } from '../config/env.js';
 import { recordAudit } from '../services/auditService.js';
 import { assertUserLimit } from '../services/planService.js';
+import { startTrial } from '../services/subscriptionService.js';
 import { DEFAULT_SIGNUP_PLAN, planLimits } from '../constants/plans.js';
 import { logger } from '../config/logger.js';
 import { runAsSystem, runWithTenantContext, type TenantContext } from '../context/tenantContext.js';
@@ -23,15 +38,23 @@ import { effectivePermissions, getAuth } from '../middleware/auth.js';
 import type {
   ChangePasswordInput,
   CreateUserInput,
+  DisableTwoFactorInput,
+  ForgotPasswordInput,
   LoginInput,
   RegisterOrganizationInput,
+  RegenerateRecoveryCodesInput,
+  ResetPasswordInput,
+  TwoFactorCodeInput,
   UpdateProfileInput,
   UpdateUserInput,
+  VerifyTwoFactorInput,
 } from '../validators/authValidators.js';
 import type { LoginInput as _Login } from '../validators/authValidators.js';
 
 const MAX_LOGIN_ATTEMPTS = 8;
 const LOCK_MINUTES = 15;
+/** صلاحية رمز استعادة كلمة المرور بالدقائق */
+const RESET_TOKEN_TTL_MINUTES = 30;
 
 interface SafeUserShape {
   _id: unknown;
@@ -47,6 +70,8 @@ interface SafeUserShape {
   lastLoginAt?: Date | null;
   extraPermissions?: string[] | null;
   deniedPermissions?: string[] | null;
+  twoFactorEnabled?: boolean;
+  twoFactorEnabledAt?: Date | null;
 }
 
 function serializeUser(user: SafeUserShape) {
@@ -64,6 +89,8 @@ function serializeUser(user: SafeUserShape) {
     technicianProfile: user.technicianProfile ?? null,
     locale: user.locale ?? 'ar-EG',
     lastLoginAt: user.lastLoginAt ?? null,
+    twoFactorEnabled: Boolean(user.twoFactorEnabled),
+    twoFactorEnabledAt: user.twoFactorEnabledAt ?? null,
     // الصلاحيات الفعلية: دور + ممنوحة شخصيًا − محجوبة (وليس الدور وحده)
     permissions: effectivePermissions({
       role,
@@ -92,6 +119,96 @@ function issueTokens(params: {
   });
   const refreshToken = signRefreshToken({ sub: params.userId, org: params.organizationId });
   return { accessToken, refreshToken, expiresIn: 15 * 60 };
+}
+
+/** سياق تدقيق صريح لمسارات المصادقة العامة (بلا توكن/سياق مستأجر). */
+function userAuditContext(user: UserDoc, req: Request): TenantContext {
+  return {
+    actor: {
+      userId: String(user._id),
+      organizationId: new Types.ObjectId(String(user.organizationId)),
+      branchId: null,
+      role: user.role as Role,
+      fullName: user.fullName,
+    },
+    organizationId: new Types.ObjectId(String(user.organizationId)),
+    branchId: null,
+    requestId: req.requestId ?? '',
+    ip: req.ip,
+    userAgent: req.headers['user-agent'] ?? '',
+  };
+}
+
+/** الجزء المشترك من إتمام الدخول: إصدار التوكنات، تدقيق، وإرجاع الجلسة. */
+async function finishLogin(
+  user: UserDoc,
+  req: Request,
+  res: Response,
+  opts: { usedTwoFactor?: boolean; usedRecoveryCode?: boolean } = {},
+) {
+  user.failedLoginAttempts = 0;
+  user.lockedUntil = null;
+  user.lastLoginAt = new Date();
+  await user.save();
+
+  const organization = await runAsSystem(() => OrganizationModel.findById(user.organizationId).lean());
+  if (!organization) throw ApiError.notFound('المؤسسة غير موجودة');
+  if (!organization.isActive) throw ApiError.forbidden('حساب المركز موقوف');
+
+  const primaryBranchId = user.branchIds?.[0] ? String(user.branchIds[0]) : null;
+  const tokens = issueTokens({
+    userId: String(user._id),
+    organizationId: String(user.organizationId),
+    branchId: primaryBranchId,
+    role: user.role as Role,
+    fullName: user.fullName,
+  });
+
+  await runWithTenantContext(
+    {
+      actor: {
+        userId: String(user._id),
+        organizationId: new Types.ObjectId(String(user.organizationId)),
+        branchId: primaryBranchId ? new Types.ObjectId(primaryBranchId) : null,
+        role: user.role as Role,
+        fullName: user.fullName,
+      },
+      organizationId: new Types.ObjectId(String(user.organizationId)),
+      branchId: primaryBranchId ? new Types.ObjectId(primaryBranchId) : null,
+      requestId: req.requestId ?? '',
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] ?? '',
+    },
+    async () => {
+      const suffix = opts.usedRecoveryCode
+        ? ' (باستخدام رمز استرداد)'
+        : opts.usedTwoFactor
+          ? ' (بعد التحقق بخطوتين)'
+          : '';
+      await recordAudit(
+        {
+          action: 'login',
+          resource: 'User',
+          resourceId: String(user._id),
+          summary: `تسجيل دخول${suffix}: ${user.username}`,
+          severity: opts.usedRecoveryCode ? 'warning' : 'info',
+        },
+        req,
+      );
+    },
+  );
+
+  return ok(res, {
+    ...tokens,
+    user: serializeUser(user as unknown as SafeUserShape),
+    organization: {
+      id: String(organization._id),
+      name: organization.name,
+      slug: organization.slug,
+      settings: organization.settings,
+      subscription: organization.subscription,
+    },
+  });
 }
 
 /**
@@ -142,22 +259,6 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
     throw ApiError.badRequest('اسم المستخدم موجود في أكثر من مركز، حدد المركز (organizationSlug)', { options });
   }
 
-  /** سياق تدقيق صريح: مسار الدخول عام (بلا توكن/سياق مستأجر) لكننا نعرف مؤسسة المستخدم */
-  const loginAuditContext = (): TenantContext => ({
-    actor: {
-      userId: String(user._id),
-      organizationId: new Types.ObjectId(String(user.organizationId)),
-      branchId: null,
-      role: user.role as Role,
-      fullName: user.fullName,
-    },
-    organizationId: new Types.ObjectId(String(user.organizationId)),
-    branchId: null,
-    requestId: req.requestId ?? '',
-    ip: req.ip,
-    userAgent: req.headers['user-agent'] ?? '',
-  });
-
   if (!user.isActive) throw ApiError.forbidden('الحساب موقوف، راجع مدير المركز');
   if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
     await recordAudit({
@@ -166,7 +267,7 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
       resourceId: String(user._id),
       summary: `محاولة دخول لحساب مقفول مؤقتًا: ${user.username}`,
       severity: 'warning',
-      context: loginAuditContext(),
+      context: userAuditContext(user, req),
     });
     throw ApiError.forbidden('الحساب مقفول مؤقتًا بسبب محاولات دخول خاطئة، حاول لاحقًا');
   }
@@ -189,69 +290,102 @@ export const login = asyncHandler(async (req: Request, res: Response) => {
         ? `محاولات دخول فاشلة — تم قفل الحساب ${LOCK_MINUTES} دقيقة: ${user.username}`
         : `محاولة دخول فاشلة: ${user.username}`,
       severity: lockedNow ? 'critical' : 'warning',
-      context: loginAuditContext(),
+      context: userAuditContext(user, req),
     });
 
     throw ApiError.unauthorized('بيانات الدخول غير صحيحة');
   }
 
-  user.failedLoginAttempts = 0;
-  user.lockedUntil = null;
-  user.lastLoginAt = new Date();
-  await user.save();
+  /**
+   * بعد صحة كلمة المرور: الحساب المفعّل للتحقق بخطوتين لا يحصل على توكنات،
+   * بل على توكن تحدٍّ قصير العمر يُستخدم مرة واحدة مع رمز TOTP أو رمز استرداد.
+   */
+  if (user.twoFactorEnabled) {
+    user.failedLoginAttempts = 0;
+    user.lockedUntil = null;
+    await user.save();
 
-  const organization = await runAsSystem(() => OrganizationModel.findById(user.organizationId).lean());
-  if (!organization) throw ApiError.notFound('المؤسسة غير موجودة');
-  if (!organization.isActive) throw ApiError.forbidden('حساب المركز موقوف');
+    const challengeToken = signTwoFactorChallenge({
+      sub: String(user._id),
+      org: String(user.organizationId),
+    });
 
-  const primaryBranchId = user.branchIds?.[0] ? String(user.branchIds[0]) : null;
-  const tokens = issueTokens({
-    userId: String(user._id),
-    organizationId: String(user.organizationId),
-    branchId: primaryBranchId,
-    role: user.role as Role,
-    fullName: user.fullName,
-  });
+    return ok(res, {
+      twoFactorRequired: true,
+      challengeToken,
+      expiresIn: env.TWO_FACTOR_CHALLENGE_TTL_MINUTES * 60,
+    });
+  }
 
-  await runWithTenantContext(
-    {
-      actor: {
-        userId: String(user._id),
-        organizationId: new Types.ObjectId(String(user.organizationId)),
-        branchId: primaryBranchId ? new Types.ObjectId(primaryBranchId) : null,
-        role: user.role as Role,
-        fullName: user.fullName,
-      },
-      organizationId: new Types.ObjectId(String(user.organizationId)),
-      branchId: primaryBranchId ? new Types.ObjectId(primaryBranchId) : null,
-      requestId: req.requestId ?? '',
-      ip: req.ip,
-      userAgent: req.headers['user-agent'] ?? '',
-    },
-    async () => {
-      await recordAudit(
-        {
-          action: 'login',
-          resource: 'User',
-          resourceId: String(user._id),
-          summary: `تسجيل دخول: ${user.username}`,
-        },
-        req,
-      );
-    },
+  return finishLogin(user, req, res);
+});
+
+/**
+ * إتمام الدخول بعد التحقق بخطوتين.
+ * رمز TOTP صالح، أو رمز استرداد يُستهلك ذريًا. المحاولات الفاشلة تتبع نفس
+ * سياسة قفل الحساب في الدخول العادي (8 محاولات ← قفل 15 دقيقة).
+ */
+export const verifyTwoFactorLogin = asyncHandler(async (req: Request, res: Response) => {
+  const { challengeToken, code } = req.body as VerifyTwoFactorInput;
+  const payload = verifyTwoFactorChallenge(challengeToken);
+
+  const user = await runAsSystem(() =>
+    UserModel.findById(payload.sub).select('+twoFactorSecret +twoFactorRecoveryCodeHashes'),
   );
+  if (!user || !user.isActive) throw ApiError.unauthorized('جلسة التحقق غير صالحة');
+  if (String(user.organizationId) !== payload.org) throw ApiError.unauthorized('جلسة التحقق غير صالحة');
+  if (!user.twoFactorEnabled || !user.twoFactorSecret) {
+    throw ApiError.unauthorized('التحقق بخطوتين غير مفعّل لهذا الحساب');
+  }
 
-  return ok(res, {
-    ...tokens,
-    user: serializeUser(user as unknown as SafeUserShape),
-    organization: {
-      id: String(organization._id),
-      name: organization.name,
-      slug: organization.slug,
-      settings: organization.settings,
-      subscription: organization.subscription,
-    },
-  });
+  if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
+    throw ApiError.forbidden('الحساب مقفول مؤقتًا بسبب محاولات دخول خاطئة، حاول لاحقًا');
+  }
+
+  let accepted = false;
+  try {
+    accepted = verifyTotp(decryptTwoFactorSecret(user.twoFactorSecret), code);
+  } catch {
+    accepted = false;
+  }
+
+  let usedRecoveryCode = false;
+  if (!accepted) {
+    const recoveryHash = hashRecoveryCode(code);
+    const consumed = await runAsSystem(() =>
+      UserModel.updateOne(
+        { _id: user._id, twoFactorRecoveryCodeHashes: recoveryHash },
+        { $pull: { twoFactorRecoveryCodeHashes: recoveryHash } },
+      ),
+    );
+    usedRecoveryCode = consumed.modifiedCount === 1;
+    accepted = usedRecoveryCode;
+  }
+
+  if (!accepted) {
+    user.failedLoginAttempts = (user.failedLoginAttempts ?? 0) + 1;
+    const lockedNow = user.failedLoginAttempts >= MAX_LOGIN_ATTEMPTS;
+    if (lockedNow) {
+      user.lockedUntil = new Date(Date.now() + LOCK_MINUTES * 60_000);
+      user.failedLoginAttempts = 0;
+    }
+    await user.save();
+
+    await recordAudit({
+      action: 'login_failed',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: lockedNow
+        ? `رمز تحقق ثنائي خاطئ — تم قفل الحساب ${LOCK_MINUTES} دقيقة: ${user.username}`
+        : `رمز تحقق ثنائي خاطئ: ${user.username}`,
+      severity: lockedNow ? 'critical' : 'warning',
+      context: userAuditContext(user, req),
+    });
+
+    throw ApiError.unauthorized('رمز التحقق أو رمز الاسترداد غير صحيح');
+  }
+
+  return finishLogin(user, req, res, { usedTwoFactor: true, usedRecoveryCode });
 });
 
 /** تجديد التوكن */
@@ -267,6 +401,17 @@ export const refresh = asyncHandler(async (req: Request, res: Response) => {
   const user = await runAsSystem(() => UserModel.findById(payload.sub).lean());
   if (!user || !user.isActive) throw ApiError.unauthorized('الجلسة غير صالحة');
   if (String(user.organizationId) !== payload.org) throw ApiError.unauthorized('الجلسة غير صالحة');
+
+  /**
+   * جلسات أُنشئت قبل تفعيل 2FA لا يجوز أن تتجاوزها: وإلا بقي جهاز قديم
+   * مسجّلًا بالتوكن فقط رغم تفعيل الحماية. نقارن وقت إصدار توكن التجديد
+   * بوقت التفعيل ونطلب دخولًا جديدًا.
+   */
+  if (user.twoFactorEnabled && user.twoFactorEnabledAt && payload.iat) {
+    if (payload.iat * 1000 < new Date(user.twoFactorEnabledAt).getTime()) {
+      throw ApiError.unauthorized('تم تفعيل التحقق بخطوتين بعد بدء هذه الجلسة، سجّل الدخول من جديد');
+    }
+  }
 
   const primaryBranchId = user.branchIds?.[0] ? String(user.branchIds[0]) : null;
   const tokens = issueTokens({
@@ -357,6 +502,9 @@ export const registerOrganization = asyncHandler(async (req: Request, res: Respo
     onboardedAt: new Date(),
   });
 
+  // الفترة التجريبية تبدأ من هنا: الحدود من باقة التسجيل لمدة TRIAL_DAYS
+  const trialState = await startTrial(String(organization._id), DEFAULT_SIGNUP_PLAN);
+
   const organizationId = new Types.ObjectId(String(organization._id));
 
   const result = await runWithTenantContext(
@@ -425,11 +573,12 @@ export const registerOrganization = asyncHandler(async (req: Request, res: Respo
       slug: organization.slug,
       role: 'owner',
       subscription: {
-        plan: organization.subscription?.plan ?? 'starter',
-        status: organization.subscription?.status ?? 'trialing',
-        maxUsers: organization.subscription?.maxUsers ?? 5,
-        maxBranches: organization.subscription?.maxBranches ?? 2,
-        monthlyTicketLimit: organization.subscription?.monthlyTicketLimit ?? 300,
+        plan: trialState.planKey,
+        status: trialState.status,
+        expiresAt: trialState.expiresAt,
+        maxUsers: trialState.plan.maxUsers,
+        maxBranches: trialState.plan.maxBranches,
+        monthlyTicketLimit: trialState.plan.monthlyTicketLimit,
       },
       settings: organization.settings,
     },
@@ -458,6 +607,210 @@ export const changePassword = asyncHandler(async (req: Request, res: Response) =
   );
 
   return ok(res, { message: 'تم تغيير كلمة المرور بنجاح' });
+});
+
+/* ------------------------------------------------------------------ */
+/*  المصادقة الثنائية (TOTP)                                          */
+/* ------------------------------------------------------------------ */
+
+/** يبدأ إعدادًا جديدًا ويُرجع السر وQR — لا يُفعّل شيئًا حتى تأكيد الرمز. */
+export const beginTwoFactorSetup = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const user = await UserModel.findById(auth.userId).select('+twoFactorSecret +twoFactorPendingSecret');
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+  if (user.twoFactorEnabled) {
+    throw ApiError.businessRule('التحقق بخطوتين مفعّل بالفعل. أوقفه أولًا لإعادة الإعداد.');
+  }
+
+  const organization = await OrganizationModel.findById(user.organizationId).select('name slug').lean();
+  const secret = generateTotpSecret();
+  user.twoFactorPendingSecret = encryptTwoFactorSecret(secret);
+  await user.save();
+
+  const otpauthUri = buildOtpAuthUri({
+    secret,
+    username: user.username,
+    organizationSlug: organization?.slug,
+    organizationName: organization?.name,
+  });
+  const qrDataUrl = await buildTotpQrDataUrl(otpauthUri);
+
+  await recordAudit(
+    {
+      action: 'update',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: 'بدء إعداد التحقق بخطوتين',
+    },
+    req,
+  );
+
+  return ok(res, {
+    secret,
+    otpauthUri,
+    qrDataUrl,
+    message: 'امسح رمز QR بتطبيق المصادقة ثم أدخل الرمز المكوّن من 6 أرقام لتأكيد التفعيل.',
+  });
+});
+
+/** يؤكّد السر المعلّق ويفعّل 2FA ويُرجع رموز الاسترداد مرة واحدة فقط. */
+export const enableTwoFactor = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const { code } = req.body as TwoFactorCodeInput;
+
+  const user = await UserModel.findById(auth.userId).select(
+    '+twoFactorPendingSecret +twoFactorSecret +twoFactorRecoveryCodeHashes',
+  );
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+  if (user.twoFactorEnabled) throw ApiError.businessRule('التحقق بخطوتين مفعّل بالفعل');
+  if (!user.twoFactorPendingSecret) throw ApiError.badRequest('ابدأ إعداد التحقق بخطوتين أولًا');
+
+  let valid = false;
+  try {
+    valid = verifyTotp(decryptTwoFactorSecret(user.twoFactorPendingSecret), code);
+  } catch {
+    valid = false;
+  }
+  if (!valid) {
+    throw ApiError.badRequest('رمز التحقق غير صحيح. تأكد من ضبط ساعة الجهاز ثم أعد المحاولة.');
+  }
+
+  const { codes, hashes } = generateRecoveryCodes();
+  user.twoFactorSecret = user.twoFactorPendingSecret;
+  user.twoFactorPendingSecret = null;
+  user.twoFactorEnabled = true;
+  user.twoFactorEnabledAt = new Date();
+  user.twoFactorRecoveryCodeHashes = hashes;
+  await user.save();
+
+  await recordAudit(
+    {
+      action: 'two_factor_enabled',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: `تفعيل التحقق بخطوتين: ${user.username}`,
+      severity: 'warning',
+    },
+    req,
+  );
+
+  return ok(res, {
+    twoFactorEnabled: true,
+    recoveryCodes: codes,
+    message: 'تم تفعيل التحقق بخطوتين. احفظ رموز الاسترداد في مكان آمن — لن تُعرض مرة أخرى.',
+  });
+});
+
+/** إيقاف 2FA يتطلب كلمة المرور + رمز TOTP صالح أو رمز استرداد. */
+export const disableTwoFactor = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const { password, code } = req.body as DisableTwoFactorInput;
+
+  const user = await UserModel.findById(auth.userId).select(
+    '+passwordHash +twoFactorSecret +twoFactorRecoveryCodeHashes',
+  );
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+  if (!user.twoFactorEnabled) throw ApiError.businessRule('التحقق بخطوتين غير مفعّل');
+
+  const passwordValid = await user.verifyPassword(password);
+  if (!passwordValid) throw ApiError.badRequest('كلمة المرور غير صحيحة');
+
+  let valid = false;
+  try {
+    valid = user.twoFactorSecret ? verifyTotp(decryptTwoFactorSecret(user.twoFactorSecret), code) : false;
+  } catch {
+    valid = false;
+  }
+
+  if (!valid) {
+    const recoveryHash = hashRecoveryCode(code);
+    const consumed = await UserModel.updateOne(
+      { _id: user._id, twoFactorRecoveryCodeHashes: recoveryHash },
+      { $pull: { twoFactorRecoveryCodeHashes: recoveryHash } },
+    );
+    valid = consumed.modifiedCount === 1;
+  }
+  if (!valid) throw ApiError.badRequest('رمز التحقق أو رمز الاسترداد غير صحيح');
+
+  user.twoFactorEnabled = false;
+  user.twoFactorSecret = null;
+  user.twoFactorPendingSecret = null;
+  user.twoFactorEnabledAt = null;
+  user.twoFactorRecoveryCodeHashes = [];
+  await user.save();
+
+  await recordAudit(
+    {
+      action: 'two_factor_disabled',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: `إيقاف التحقق بخطوتين: ${user.username}`,
+      severity: 'warning',
+    },
+    req,
+  );
+
+  return ok(res, {
+    twoFactorEnabled: false,
+    message: 'تم إيقاف التحقق بخطوتين. يمكنك إعادة تفعيله في أي وقت.',
+  });
+});
+
+/** تجديد رموز الاسترداد يتطلب كلمة المرور + رمز TOTP حالي. */
+export const regenerateRecoveryCodes = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const { password, code } = req.body as RegenerateRecoveryCodesInput;
+
+  const user = await UserModel.findById(auth.userId).select('+passwordHash +twoFactorSecret');
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+  if (!user.twoFactorEnabled || !user.twoFactorSecret) {
+    throw ApiError.businessRule('التحقق بخطوتين غير مفعّل');
+  }
+
+  const passwordValid = await user.verifyPassword(password);
+  if (!passwordValid) throw ApiError.badRequest('كلمة المرور غير صحيحة');
+
+  let valid = false;
+  try {
+    valid = verifyTotp(decryptTwoFactorSecret(user.twoFactorSecret), code);
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw ApiError.badRequest('رمز التحقق غير صحيح');
+
+  const { codes, hashes } = generateRecoveryCodes();
+  user.twoFactorRecoveryCodeHashes = hashes;
+  await user.save();
+
+  await recordAudit(
+    {
+      action: 'two_factor_recovery_regenerated',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: `تجديد رموز استرداد التحقق بخطوتين: ${user.username}`,
+      severity: 'warning',
+    },
+    req,
+  );
+
+  return ok(res, {
+    recoveryCodes: codes,
+    message: 'تم تجديد رموز الاسترداد. الرموز القديمة لم تعد صالحة — احفظ الجديدة الآن.',
+  });
+});
+
+/** حالة 2FA للمستخدم الحالي — لا يكشف السر ولا الرموز. */
+export const twoFactorStatus = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  const user = await UserModel.findById(auth.userId).select('+twoFactorRecoveryCodeHashes');
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+
+  return ok(res, {
+    enabled: Boolean(user.twoFactorEnabled),
+    enabledAt: user.twoFactorEnabledAt ?? null,
+    recoveryCodesRemaining: (user.twoFactorRecoveryCodeHashes ?? []).length,
+    recommended: ['owner', 'admin', 'manager'].includes(user.role),
+  });
 });
 
 /** تحديث الملف الشخصي */
@@ -640,15 +993,225 @@ export const deactivateUser = asyncHandler(async (req: Request, res: Response) =
   return ok(res, { message: 'تم تعطيل المستخدم' });
 });
 
-/** قائمة الأدوار والصلاحيات المتاحة لعرضها في الواجهة */
-export const rolesCatalog = asyncHandler(async (_req: Request, res: Response) => {
-  const { ROLES, ROLE_LABELS_AR, ROLE_PERMISSIONS, PERMISSIONS } = await import('../constants/roles.js');
+/**
+ * إعادة تعيين 2FA لمستخدم آخر بواسطة الإدارة.
+ * المسار الوحيد لاستعادة الحساب عند فقد الهاتف وكل رموز الاسترداد معًا.
+ * لا يسمح بتعطيل 2FA عن حساب المدير نفسه — يستخدم تدفق الإيقاف العادي.
+ */
+export const resetUserTwoFactor = asyncHandler(async (req: Request, res: Response) => {
+  const auth = getAuth(req);
+  if (String(req.params.id) === auth.userId) {
+    throw ApiError.businessRule('لا يمكنك إعادة تعيين التحقق بخطوتين لحسابك الحالي — استخدم إعدادات الأمان');
+  }
+
+  const user = await UserModel.findById(req.params.id).select(
+    '+twoFactorSecret +twoFactorPendingSecret +twoFactorRecoveryCodeHashes',
+  );
+  if (!user) throw ApiError.notFound('المستخدم غير موجود');
+  if (!user.twoFactorEnabled && !user.twoFactorPendingSecret) {
+    throw ApiError.businessRule('التحقق بخطوتين غير مفعّل لهذا المستخدم');
+  }
+
+  user.twoFactorEnabled = false;
+  user.twoFactorSecret = null;
+  user.twoFactorPendingSecret = null;
+  user.twoFactorEnabledAt = null;
+  user.twoFactorRecoveryCodeHashes = [];
+  await user.save();
+
+  await recordAudit(
+    {
+      action: 'two_factor_disabled',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: `إعادة تعيين التحقق بخطوتين بواسطة الإدارة: ${user.username}`,
+      severity: 'critical',
+    },
+    req,
+  );
+
   return ok(res, {
-    roles: ROLES.map((role) => ({
+    message: 'تمت إعادة تعيين التحقق بخطوتين. على المستخدم تسجيل الدخول بكلمة المرور وإعادة الإعداد.',
+  });
+});
+
+/** قائمة الأدوار والصلاحيات المتاحة لعرضها في الواجهة — أدوار المركز فقط */
+export const rolesCatalog = asyncHandler(async (_req: Request, res: Response) => {
+  const { CENTER_ASSIGNABLE_ROLES, ROLE_LABELS_AR, ROLE_PERMISSIONS, CENTER_ASSIGNABLE_PERMISSIONS } = await import(
+    '../constants/roles.js'
+  );
+  return ok(res, {
+    roles: CENTER_ASSIGNABLE_ROLES.map((role) => ({
       value: role,
       label: ROLE_LABELS_AR[role],
       permissions: ROLE_PERMISSIONS[role] as Permission[],
     })),
-    allPermissions: PERMISSIONS,
+    allPermissions: CENTER_ASSIGNABLE_PERMISSIONS,
   });
+});
+
+/* ------------------------------------------------------------------ */
+/* استعادة كلمة المرور (Self-service)                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * طلب رمز استعادة كلمة المرور.
+ *
+ * الأمان:
+ *  - الرد دائمًا عام مهما كان البريد موجودًا (لا يكشف قائمة مستخدمي المنصة).
+ *  - نخزّن SHA-256 للرمز مع صلاحية 30 دقيقة، ونستخدمه مرة واحدة.
+ *  - إعادة الطلب تُلغي أي رمز سابق (حقل واحد فقط).
+ *  - في بيئة التطوير نُرجع الرمز نفسه في الاستجابة لتسهيل الاختبار بدون بريد.
+ */
+export const forgotPassword = asyncHandler(async (req: Request, res: Response) => {
+  const { email } = req.body as ForgotPasswordInput;
+
+  // تنظيف الرموز المنتهية — عملية رخيصة تُدار مع كل طلب بدل مهمة منفصلة
+  await runAsSystem(() =>
+    UserModel.updateMany(
+      { passwordResetExpiresAt: { $ne: null, $lt: new Date() } },
+      { $unset: { passwordResetTokenHash: '', passwordResetExpiresAt: '' } },
+    ),
+  );
+
+  /**
+   * البريد فريد داخل المركز فقط، فقد ينتمي لحسابات في أكثر من مركز. ننشئ رمزًا
+   * لكل حساب مطابق (في الإنتاج تصل رسالة لكل حساب) بدل إعادة تعيين حساب اعتباطي.
+   */
+  interface ResetCandidate {
+    _id: Types.ObjectId;
+    username: string;
+    fullName: string;
+    role: string;
+    organizationId: Types.ObjectId;
+    isActive?: boolean;
+  }
+  const users = (await runAsSystem(() =>
+    UserModel.find({ email }).select('+passwordResetTokenHash isActive').lean(),
+  )) as unknown as ResetCandidate[];
+
+  const activeUsers = users.filter((u) => u.isActive === true);
+
+  interface OrgRow {
+    _id: Types.ObjectId;
+    slug: string;
+    name: string;
+  }
+  const orgs = (activeUsers.length
+    ? await runAsSystem(() =>
+        OrganizationModel.find({ _id: { $in: activeUsers.map((u) => u.organizationId) } })
+          .select('slug name')
+          .lean(),
+      )
+    : []) as unknown as OrgRow[];
+  const orgByUserId = new Map(orgs.map((o) => [String(o._id), o]));
+
+  const devTokens: { organizationSlug: string; organizationName: string; resetToken: string }[] = [];
+
+  for (const user of activeUsers) {
+    const { token, hash } = generatePasswordResetToken();
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MINUTES * 60_000);
+    await runAsSystem(async () => {
+      await UserModel.updateOne(
+        { _id: user._id },
+        { $set: { passwordResetTokenHash: hash, passwordResetExpiresAt: expiresAt } },
+      );
+    });
+
+    await runAsSystem(async () => {
+      await recordAudit({
+        action: 'password_change',
+        resource: 'User',
+        resourceId: String(user._id),
+        summary: `طلب رمز استعادة كلمة المرور: ${user.username}`,
+        context: {
+          actor: {
+            userId: String(user._id),
+            organizationId: user.organizationId as Types.ObjectId,
+            branchId: null,
+            role: user.role as Role,
+            fullName: user.fullName,
+          },
+          organizationId: user.organizationId as Types.ObjectId,
+          branchId: null,
+          requestId: req.requestId ?? '',
+          ip: req.ip,
+          userAgent: req.headers['user-agent'] ?? '',
+        },
+      });
+    });
+
+    if (!env.isProd) {
+      const org = orgByUserId.get(String(user.organizationId));
+      devTokens.push({
+        organizationSlug: org?.slug ?? '',
+        organizationName: org?.name ?? '',
+        resetToken: token,
+      });
+    }
+  }
+
+  // وضع التطوير فقط: رمز واحد → نفس شكل الاستجابة السابق؛ أكثر من حساب → رمز لكل مركز
+  const devExtras =
+    devTokens.length === 0
+      ? {}
+      : devTokens.length === 1
+        ? { resetToken: devTokens[0]!.resetToken, note: 'رمز تطوير — في الإنتاج يُرسل بالبريد فقط' }
+        : {
+            resetTokens: devTokens,
+            note: `البريد مرتبط بـ${devTokens.length} مراكز — رمز لكل حساب (وضع التطوير فقط)`,
+          };
+
+  return ok(res, {
+    message: 'لو كان البريد مسجلًا لدينا فستصلك رسالة تحتوي رمز استعادة كلمة المرور',
+    ...devExtras,
+  });
+});
+
+/**
+ * تعيين كلمة مرور جديدة برمز الاستعادة.
+ * الرمز يُستخدم مرة واحدة، ونصفّر عدّاد المحاولات الفاشلة والقفل عند النجاح.
+ */
+export const resetPassword = asyncHandler(async (req: Request, res: Response) => {
+  const { token, password } = req.body as ResetPasswordInput;
+  const tokenHash = hashToken(token);
+
+  /**
+   * استهلاك ذري للرمز: شرط التحديث يضم الرمز وسلامة صلاحيته معًا، وتصفيره يحدث
+   * في نفس العملية — فلا نافذة سباق بين "فحص" و"حفظ"، ولا يمكن استخدام الرمز
+   * مرتين حتى تحت طلبات متزامنة ( findOneAndUpdate ذرية).
+   */
+  const user = await runAsSystem(() =>
+    UserModel.consumePasswordResetToken(tokenHash, password),
+  );
+
+  if (!user) {
+    throw ApiError.badRequest('رمز الاستعادة غير صحيح أو منتهي الصلاحية، اطلب رمزًا جديدًا');
+  }
+
+  await runAsSystem(async () => {
+    await recordAudit({
+      action: 'password_change',
+      resource: 'User',
+      resourceId: String(user._id),
+      summary: `تعيين كلمة مرور جديدة عبر رمز الاستعادة: ${user.username}`,
+      severity: 'warning',
+      context: {
+        actor: {
+          userId: String(user._id),
+          organizationId: user.organizationId as Types.ObjectId,
+          branchId: null,
+          role: user.role as Role,
+          fullName: user.fullName,
+        },
+        organizationId: user.organizationId as Types.ObjectId,
+        branchId: null,
+        requestId: req.requestId ?? '',
+        ip: req.ip,
+        userAgent: req.headers['user-agent'] ?? '',
+      },
+    });
+  });
+
+  return ok(res, { message: 'تم تحديث كلمة المرور، يمكنك تسجيل الدخول الآن' });
 });

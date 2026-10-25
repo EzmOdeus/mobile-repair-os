@@ -18,15 +18,20 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "seed": "npm run build:api && npm run seed --workspace @mros/api",
     "seed:reset": "npm run build:api && npm run seed:reset --workspace @mros/api",
+    "bootstrap:platform": "npm run build:api && npm run bootstrap:platform --workspace @mros/api",
     "e2e": "npm run e2e --workspace @mros/api",
     "fix:indexes": "npm run build:api && npm run fix:indexes --workspace @mros/api",
     "fix:indexes:dry": "npm run build:api && npm run fix:indexes:dry --workspace @mros/api",
     "fix:counters": "npm run build:api && npm run fix:counters --workspace @mros/api",
     "fix:counters:dry": "npm run build:api && npm run fix:counters:dry --workspace @mros/api",
+    "audit:finance": "npm run build:api && npm run audit:finance --workspace @mros/api",
     "test": "npm run test --workspace @mros/api",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
     "clean": "node -e \"const{rmSync}=require('fs');['node_modules','apps/api/node_modules','apps/web/node_modules','apps/api/dist','apps/web/.next'].forEach(p=>{try{rmSync(p,{recursive:true,force:true});console.log('deleted: '+p)}catch{}})\""
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "concurrently": "9.2.1"
   },
   "engines": {

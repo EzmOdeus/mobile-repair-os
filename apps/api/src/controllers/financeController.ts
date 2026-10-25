@@ -6,13 +6,15 @@ import { ExpenseModel } from '../models/Expense.js';
 import { RepairTicketModel } from '../models/RepairTicket.js';
 import { RepairPartModel } from '../models/RepairPart.js';
 import { RepairLaborModel } from '../models/RepairLabor.js';
+import { EstimateModel } from '../models/Estimate.js';
 import { CustomerModel } from '../models/Customer.js';
 import { PartModel } from '../models/Part.js';
 import { OrganizationModel } from '../models/Organization.js';
+import { BranchModel } from '../models/Branch.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok, paginated } from '../utils/asyncHandler.js';
 import { parseCsv, parseListQuery, parseSort, regexSearch } from '../utils/queryHelpers.js';
-import { getAuth } from '../middleware/auth.js';
+import { getAuth, branchFilter, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { computeTotals, money } from '../utils/money.js';
@@ -22,6 +24,10 @@ import { normalizeEgyptPhone } from '../validators/common.js';
 import { addDays } from '../utils/dates.js';
 import { sendNotification } from '../services/notificationService.js';
 import { applyStockMovement } from '../services/inventoryService.js';
+import { assertExpenseShiftEditable, resolveOpenShiftForDate, resolveOpenShiftId } from '../services/shiftService.js';
+import { rollbackPosSaleStock } from '../services/posService.js';
+import { buildInvoicePdf, type InvoicePdfInput } from '../services/invoicePdfService.js';
+import { logger } from '../config/logger.js';
 
 /* ============================ الفواتير ============================ */
 
@@ -37,6 +43,8 @@ export const listInvoices = async (req: Request, res: Response) => {
   if (statuses.length) filter.status = { $in: statuses };
   const types = parseCsv(query.type);
   if (types.length) filter.type = { $in: types };
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
   if (query.customerId) filter.customerId = query.customerId;
   if (query.ticketId) filter.ticketId = query.ticketId;
   if (query.unpaid === 'true') filter['totals.dueEgp'] = { $gt: 0.009 };
@@ -62,9 +70,56 @@ export const getInvoice = async (req: Request, res: Response) => {
     .populate('createdBy', 'fullName')
     .lean();
   if (!invoice) throw ApiError.notFound('الفاتورة غير موجودة');
+  requireBranchAccess(req, invoice.branchId);
 
   const payments = await PaymentModel.find({ invoiceId: invoice._id }).sort({ paidAt: -1 }).lean();
   return ok(res, { invoice, payments });
+};
+
+/** فاتورة PDF عربية RTL مع رمز QR لبيانات التحقق الضريبية */
+export const downloadInvoicePdf = async (req: Request, res: Response) => {
+  const invoice = await InvoiceModel.findById(req.params.id)
+    .populate('customerId', 'fullName companyName phone phoneAlt address')
+    .populate('ticketId', 'ticketNumber')
+    .lean();
+  if (!invoice) throw ApiError.notFound('الفاتورة غير موجودة');
+  requireBranchAccess(req, invoice.branchId);
+
+  const [organization, branch, payments] = await Promise.all([
+    OrganizationModel.findById(invoice.organizationId).lean(),
+    invoice.branchId
+      ? BranchModel.findById(invoice.branchId).select('name code phone email address').lean()
+      : Promise.resolve(null),
+    PaymentModel.find({ invoiceId: invoice._id })
+      .select('receiptNumber method amountEgp paidAt isRefund')
+      .sort({ paidAt: -1 })
+      .lean(),
+  ]);
+  if (!organization) throw ApiError.notFound('المؤسسة غير موجودة');
+
+  const pdf = await buildInvoicePdf({
+    invoice: invoice as unknown as InvoicePdfInput['invoice'],
+    organization: organization as unknown as InvoicePdfInput['organization'],
+    branch: branch as unknown as InvoicePdfInput['branch'],
+    payments: payments as unknown as InvoicePdfInput['payments'],
+  });
+
+  await recordAudit(
+    {
+      action: 'export',
+      resource: 'Invoice',
+      resourceId: String(invoice._id),
+      summary: `تنزيل فاتورة PDF: ${invoice.invoiceNumber}`,
+    },
+    req,
+  );
+
+  const filename = `invoice-${invoice.invoiceNumber.replace(/[^\w.-]/g, '_')}.pdf`;
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Content-Length', String(pdf.length));
+  res.setHeader('Cache-Control', 'private, no-store');
+  return res.send(pdf);
 };
 
 /**
@@ -94,15 +149,20 @@ export const createInvoice = async (req: Request, res: Response) => {
   let ticketId = body.ticketId ? new Types.ObjectId(body.ticketId) : null;
   let deviceId: Types.ObjectId | null = null;
   let warrantyDays = 0;
+  let invoiceBranchId: Types.ObjectId | null = null;
+  let invoiceDiscountEgp = body.discountEgp;
 
   // بناء الفاتورة من التذكرة
   if (body.buildFromTicket && ticketId) {
     const ticket = await RepairTicketModel.findById(ticketId);
     if (!ticket) throw ApiError.notFound('التذكرة غير موجودة');
+    requireBranchAccess(req, ticket.branchId);
 
     customerId = ticket.customerId as Types.ObjectId;
     deviceId = ticket.deviceId as Types.ObjectId;
     warrantyDays = ticket.warranty.policyDays ?? 0;
+    invoiceBranchId = ticket.branchId as Types.ObjectId;
+    invoiceDiscountEgp = body.discountEgp || ticket.cost.discountEgp || 0;
 
     const [parts, labor] = await Promise.all([
       RepairPartModel.find({ ticketId: ticket._id, status: { $in: ['reserved', 'installed'] } })
@@ -130,8 +190,29 @@ export const createInvoice = async (req: Request, res: Response) => {
       })),
     ];
 
+    /**
+     * التذاكر المعتمدة من عرض سعر لا تُنشئ بنود مصنعية/قطع تلقائيًا.
+     * عند غياب بنود فعلية، تُبنى الفاتورة من بنود عرض السعر المعتمد حتى لا يتعطل التحصيل.
+     */
     if (!lines.length) {
-      throw ApiError.businessRule('لا توجد بنود على التذكرة لبناء الفاتورة (أضف قطعًا أو مصنعية)');
+      const approvedEstimate = await EstimateModel.findOne({
+        ticketId: ticket._id,
+        status: { $in: ['approved', 'partially_approved'] },
+      })
+        .sort({ version: -1 })
+        .lean();
+      const approvedLines = approvedEstimate?.lines.filter((l) => l.approved !== false) ?? [];
+      if (!approvedLines.length) {
+        throw ApiError.businessRule('لا توجد بنود على التذكرة ولا عرض سعر معتمد لبناء الفاتورة (أضف قطعًا أو مصنعية)');
+      }
+      lines = approvedLines.map((l) => ({
+        kind: l.kind,
+        refId: String(l._id),
+        description: l.description,
+        quantity: l.quantity ?? 1,
+        unitPriceEgp: l.unitPriceEgp ?? 0,
+        warrantyDays: l.warrantyDays ?? warrantyDays,
+      }));
     }
   }
 
@@ -149,7 +230,7 @@ export const createInvoice = async (req: Request, res: Response) => {
 
   const totals = computeTotals({
     lines: preparedLines,
-    discountEgp: body.discountEgp,
+    discountEgp: invoiceDiscountEgp,
     taxRatePct,
     taxInclusive: organization?.settings?.taxInclusive ?? true,
   });
@@ -157,7 +238,7 @@ export const createInvoice = async (req: Request, res: Response) => {
   const invoice = await withUniqueRetry(nextInvoiceNumber, (invoiceNumber) =>
     InvoiceModel.create({
       organizationId: ctx!.organizationId,
-      branchId: ctx!.branchId,
+      branchId: invoiceBranchId ?? ctx!.branchId,
       invoiceNumber,
       type: body.type,
       status: body.issueNow ? 'issued' : 'draft',
@@ -210,6 +291,7 @@ export const createInvoice = async (req: Request, res: Response) => {
 export const voidInvoice = async (req: Request, res: Response) => {
   const invoice = await InvoiceModel.findById(req.params.id);
   if (!invoice) throw ApiError.notFound('الفاتورة غير موجودة');
+  requireBranchAccess(req, invoice.branchId);
   if (invoice.status === 'void') throw ApiError.businessRule('الفاتورة ملغاة بالفعل');
 
   const paid = invoice.totals.paidEgp ?? 0;
@@ -241,8 +323,13 @@ export const listPayments = async (req: Request, res: Response) => {
   if (methods.length) filter.method = { $in: methods };
   if (query.invoiceId) filter.invoiceId = query.invoiceId;
   if (query.customerId) filter.customerId = query.customerId;
+  if (query.supplierId) filter.supplierId = query.supplierId;
+  if (query.purchaseOrderId) filter.purchaseOrderId = query.purchaseOrderId;
   if (query.ticketId) filter.ticketId = query.ticketId;
   if (query.direction) filter.direction = query.direction;
+  if (query.isRefund !== undefined) filter.isRefund = query.isRefund === 'true';
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
   if (query.from || query.to) {
     const range: Record<string, Date> = {};
     if (query.from) range.$gte = new Date(String(query.from));
@@ -250,10 +337,18 @@ export const listPayments = async (req: Request, res: Response) => {
     filter.paidAt = range;
   }
 
+  const aggregateMatch: Record<string, unknown> = { ...filter };
+  for (const field of ['invoiceId', 'customerId', 'supplierId', 'purchaseOrderId', 'ticketId']) {
+    const value = aggregateMatch[field];
+    if (typeof value === 'string' && Types.ObjectId.isValid(value)) aggregateMatch[field] = new Types.ObjectId(value);
+  }
+
   const [items, total, aggregate] = await Promise.all([
     PaymentModel.find(filter)
       .populate('customerId', 'fullName phone')
+      .populate('supplierId', 'name phone')
       .populate('invoiceId', 'invoiceNumber')
+      .populate('purchaseOrderId', 'poNumber')
       .populate('recordedBy', 'fullName')
       .sort({ paidAt: -1 })
       .skip(skip)
@@ -261,7 +356,7 @@ export const listPayments = async (req: Request, res: Response) => {
       .lean(),
     PaymentModel.countDocuments(filter),
     PaymentModel.aggregate<{ _id: string; total: number }>([
-      { $match: filter },
+      { $match: aggregateMatch },
       { $group: { _id: '$method', total: { $sum: '$amountEgp' } } },
     ]),
   ]);
@@ -315,15 +410,40 @@ export const recordPayment = async (req: Request, res: Response) => {
   }
 
   if (invoice) {
+    requireBranchAccess(req, invoice.branchId);
     ticketId = invoice.ticketId as Types.ObjectId | null;
+    if (invoice.status === 'void') throw ApiError.businessRule('لا يمكن تسجيل حركة مالية على فاتورة ملغاة');
+
+    const paidEgp = money(invoice.totals.paidEgp ?? 0);
+    const dueEgp = money(invoice.totals.dueEgp ?? 0);
+    if (body.isRefund) {
+      if (paidEgp <= 0.009) throw ApiError.businessRule('لا توجد مدفوعات قابلة للاسترداد على هذه الفاتورة');
+      if (body.amountEgp > paidEgp + 0.009) {
+        throw ApiError.businessRule('قيمة الاسترداد أكبر من المبلغ المدفوع', { paidEgp });
+      }
+      if (!body.refundReason?.trim()) throw ApiError.badRequest('سبب الاسترداد مطلوب');
+    } else if (body.amountEgp > dueEgp + 0.009) {
+      throw ApiError.businessRule('قيمة الدفعة أكبر من المتبقي على الفاتورة', { dueEgp });
+    }
+  } else if (body.isRefund) {
+    throw ApiError.badRequest('الاسترداد يتطلب فاتورة مرتبطة');
   }
 
   const change = body.method === 'cash' && body.tenderedEgp > body.amountEgp ? money(body.tenderedEgp - body.amountEgp) : 0;
 
+  // الدفعة تتبع فرع الفاتورة/التذكرة، لا الفرع النشط للمستخدم (خاصة عند اختيار «كل الفروع»)
+  let paymentBranchId = invoice?.branchId ?? null;
+  if (!paymentBranchId && ticketId) {
+    const ticketBranch = await RepairTicketModel.findById(ticketId).select('branchId').lean();
+    requireBranchAccess(req, ticketBranch?.branchId);
+    paymentBranchId = (ticketBranch?.branchId as Types.ObjectId | undefined) ?? null;
+  }
+  const paymentShiftId = await resolveOpenShiftId(paymentBranchId ?? ctx!.branchId);
+
   const payment = await withUniqueRetry(nextReceiptNumber, (receiptNumber) =>
     PaymentModel.create({
       organizationId: ctx!.organizationId,
-      branchId: ctx!.branchId,
+      branchId: paymentBranchId ?? ctx!.branchId,
       receiptNumber,
       direction: body.isRefund ? 'out' : 'in',
       method: body.method,
@@ -331,6 +451,7 @@ export const recordPayment = async (req: Request, res: Response) => {
       invoiceId: invoice?._id ?? null,
       ticketId,
       customerId: invoice?.customerId ?? (body.customerId ? new Types.ObjectId(body.customerId) : null),
+      shiftId: paymentShiftId,
       reference: body.reference ?? '',
       walletNumber: body.walletNumber ?? '',
       cardLast4: body.cardLast4 ?? '',
@@ -350,17 +471,22 @@ export const recordPayment = async (req: Request, res: Response) => {
     const paidDelta = body.isRefund ? -body.amountEgp : body.amountEgp;
     const newPaid = money(Math.max(0, (invoice.totals.paidEgp ?? 0) + paidDelta));
     invoice.totals.paidEgp = newPaid;
-    invoice.totals.dueEgp = money(Math.max(0, (invoice.totals.totalEgp ?? 0) - newPaid));
+    /** الاسترداد الكامل يُصفّر المستحق بدل إظهاره كدين جديد على العميل */
+    invoice.totals.dueEgp = body.isRefund && newPaid <= 0.009
+      ? 0
+      : money(Math.max(0, (invoice.totals.totalEgp ?? 0) - newPaid));
     invoice.totals.changeEgp = change;
     invoice.cashierId = new Types.ObjectId(auth.userId);
 
-    if (invoice.totals.dueEgp <= 0.009 && !body.isRefund) {
+    if (body.isRefund) {
+      // الاسترداد الكامل فقط يجعل الفاتورة «مرتجعة»، الجزئي يبقيها «مدفوعة جزئيًا»
+      invoice.status = newPaid <= 0.009 ? 'refunded' : 'partially_paid';
+      invoice.paidAt = null;
+    } else if (invoice.totals.dueEgp <= 0.009) {
       invoice.status = 'paid';
       invoice.paidAt = new Date();
-    } else if (newPaid > 0 && !body.isRefund) {
+    } else if (newPaid > 0) {
       invoice.status = 'partially_paid';
-    } else if (body.isRefund && newPaid < (invoice.totals.totalEgp ?? 0)) {
-      invoice.status = 'refunded';
     }
     await invoice.save();
   }
@@ -371,7 +497,9 @@ export const recordPayment = async (req: Request, res: Response) => {
     if (ticket) {
       const paidDelta = body.isRefund ? -body.amountEgp : body.amountEgp;
       ticket.cost.paidEgp = money(Math.max(0, (ticket.cost.paidEgp ?? 0) + paidDelta));
-      ticket.cost.dueEgp = money(Math.max(0, (ticket.cost.totalFinalEgp ?? 0) - (ticket.cost.paidEgp ?? 0)));
+      ticket.cost.dueEgp = invoice
+        ? money(invoice.totals.dueEgp ?? 0)
+        : money(Math.max(0, (ticket.cost.totalFinalEgp ?? 0) - (ticket.cost.paidEgp ?? 0)));
 
       await ticket.save();
 
@@ -442,6 +570,8 @@ export const listExpenses = async (req: Request, res: Response) => {
   const filter: Record<string, unknown> = {};
   const categories = parseCsv(query.category);
   if (categories.length) filter.category = { $in: categories };
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
   if (query.from || query.to) {
     const range: Record<string, Date> = {};
     if (query.from) range.$gte = new Date(String(query.from));
@@ -484,10 +614,14 @@ export const createExpense = async (req: Request, res: Response) => {
   const ctx = getTenantContext();
   const body = req.body as Record<string, unknown>;
 
+  const incurredAt = body.incurredAt ? new Date(String(body.incurredAt)) : new Date();
+  const shiftId = await resolveOpenShiftForDate(ctx!.branchId, incurredAt);
+
   const expense = await ExpenseModel.create({
     organizationId: ctx!.organizationId,
     branchId: ctx!.branchId,
     ...body,
+    shiftId,
     createdBy: new Types.ObjectId(auth.userId),
   });
 
@@ -502,6 +636,8 @@ export const createExpense = async (req: Request, res: Response) => {
 export const updateExpense = async (req: Request, res: Response) => {
   const expense = await ExpenseModel.findById(req.params.id);
   if (!expense) throw ApiError.notFound('المصروف غير موجود');
+  requireBranchAccess(req, expense.branchId);
+  await assertExpenseShiftEditable(expense.shiftId);
   Object.assign(expense, req.body);
   await expense.save();
   await recordAudit({ action: 'update', resource: 'Expense', resourceId: String(expense._id), summary: `تحديث مصروف: ${expense.title}` }, req);
@@ -511,6 +647,8 @@ export const updateExpense = async (req: Request, res: Response) => {
 export const deleteExpense = async (req: Request, res: Response) => {
   const expense = await ExpenseModel.findById(req.params.id);
   if (!expense) throw ApiError.notFound('المصروف غير موجود');
+  requireBranchAccess(req, expense.branchId);
+  await assertExpenseShiftEditable(expense.shiftId);
   await ExpenseModel.findByIdAndDelete(expense._id);
   await recordAudit(
     { action: 'delete', resource: 'Expense', resourceId: String(expense._id), summary: `حذف مصروف: ${expense.title}`, severity: 'warning' },
@@ -607,75 +745,136 @@ export const posSale = async (req: Request, res: Response) => {
     taxInclusive: organization?.settings?.taxInclusive ?? true,
   });
 
-  // خصم المخزون أولًا: إن فشل، لا تُصدر الفاتورة
-  for (const op of stockOperations) {
-    await applyStockMovement({
-      partId: op.partId,
-      type: 'sale_out',
-      quantity: -op.quantity,
-      ticketId: null,
-      reason: 'بيع مباشر من نقاط البيع',
-      actor: { userId: auth.userId, fullName: auth.fullName },
-    });
-  }
+  /**
+   * البيع الآجل لا يُسجَّل كمدفوع: كانت القيمة 0 تُستبدل بالإجمالي لأنها falsy،
+   * فيظهر الآجل مدفوعًا بالكامل ويُنشأ إيصال تحصيل وهمي.
+   */
+  const isCredit = body.paymentMethod === 'credit';
+  const tendered = isCredit ? 0 : body.amountPaidEgp || totals.totalEgp;
+  const change = isCredit ? 0 : money(Math.max(0, tendered - totals.totalEgp));
+  const paidEgp = isCredit ? 0 : money(Math.min(tendered, totals.totalEgp));
+  if (!isCredit && paidEgp <= 0) throw ApiError.badRequest('المبلغ المدفوع يجب أن يكون أكبر من صفر');
 
+  /**
+   * ترتيب التنفيذ مصمم لعدم ترك أثر جزئي على MongoDB standalone (بلا معاملات):
+   * 1) مسودة فاتورة (لا أثر مخزون بعد).
+   * 2) خصم المخزون بحركات مربوطة بالفاتورة.
+   * 3) الدفعة.
+   * 4) تثبيت الفاتورة.
+   * أي فشل في 2-4 يعكس المخزون ويحذف الدفعة والمسودة. وانهيار العملية نفسها
+   * تُعالجه recoverIncompletePosSales عند الإقلاع.
+   */
   const invoice = await withUniqueRetry(nextInvoiceNumber, (invoiceNumber) =>
     InvoiceModel.create({
       organizationId: ctx!.organizationId,
       branchId: ctx!.branchId,
       invoiceNumber,
       type: 'pos_sale',
-      status: 'issued',
+      status: 'draft',
       customerId,
       lines,
-      totals: { ...totals, taxRatePct, changeEgp: 0 },
-      issuedAt: new Date(),
+      totals: { ...totals, taxRatePct, paidEgp: 0, dueEgp: totals.totalEgp, changeEgp: 0 },
+      issuedAt: null,
       notes: body.notes ?? '',
       createdBy: new Types.ObjectId(auth.userId),
       cashierId: new Types.ObjectId(auth.userId),
     }),
   );
 
-  const tendered = body.amountPaidEgp || totals.totalEgp;
-  const change = money(Math.max(0, tendered - totals.totalEgp));
+  let payment: Record<string, unknown> | null = null;
 
-  const payment = await withUniqueRetry(nextReceiptNumber, (receiptNumber) =>
-    PaymentModel.create({
-      organizationId: ctx!.organizationId,
-      branchId: ctx!.branchId,
-      receiptNumber,
-      direction: 'in',
-      method: body.paymentMethod,
-      amountEgp: money(Math.min(tendered, totals.totalEgp)),
-      invoiceId: invoice._id,
-      customerId,
-      tenderedEgp: money(tendered),
-      changeEgp: change,
-      recordedBy: new Types.ObjectId(auth.userId),
-      paidAt: new Date(),
-    }),
-  );
+  try {
+    for (const op of stockOperations) {
+      await applyStockMovement({
+        partId: op.partId,
+        type: 'sale_out',
+        quantity: -op.quantity,
+        ticketId: null,
+        invoiceId: invoice._id,
+        reference: invoice.invoiceNumber,
+        reason: 'بيع مباشر من نقاط البيع',
+        actor: { userId: auth.userId, fullName: auth.fullName },
+      });
+    }
 
-  invoice.totals.paidEgp = payment.amountEgp;
-  invoice.totals.dueEgp = money(Math.max(0, totals.totalEgp - payment.amountEgp));
-  invoice.totals.changeEgp = change;
-  invoice.status = invoice.totals.dueEgp <= 0.009 ? 'paid' : 'partially_paid';
-  if (invoice.status === 'paid') invoice.paidAt = new Date();
-  await invoice.save();
+    if (!isCredit) {
+      const paymentShiftId = await resolveOpenShiftId(ctx!.branchId);
+      const createdPayment = await withUniqueRetry(nextReceiptNumber, (receiptNumber) =>
+        PaymentModel.create({
+          organizationId: ctx!.organizationId,
+          branchId: ctx!.branchId,
+          receiptNumber,
+          direction: 'in',
+          method: body.paymentMethod,
+          amountEgp: paidEgp,
+          invoiceId: invoice._id,
+          customerId,
+          shiftId: paymentShiftId,
+          tenderedEgp: money(tendered),
+          changeEgp: change,
+          recordedBy: new Types.ObjectId(auth.userId),
+          paidAt: new Date(),
+        }),
+      );
+      payment = createdPayment.toObject();
+    }
+
+    invoice.totals.paidEgp = paidEgp;
+    invoice.totals.dueEgp = money(Math.max(0, totals.totalEgp - paidEgp));
+    invoice.totals.changeEgp = change;
+    invoice.status = isCredit ? 'issued' : invoice.totals.dueEgp <= 0.009 ? 'paid' : 'partially_paid';
+    invoice.issuedAt = new Date();
+    if (invoice.status === 'paid') invoice.paidAt = new Date();
+    await invoice.save();
+  } catch (error) {
+    /**
+     * التعويض: حذف الدفعة أولًا (حتى لا تراها استعادة الإقلاع وتثبّت البيع)،
+     * ثم عكس حركات المخزون، ثم حذف المسودة. لو فشل أي جزء نترك المسودة
+     * للاسترداد التلقائي بدل حذف أثر قد يكون نصف مُعوَّض.
+     */
+    let paymentRemoved = true;
+    try {
+      await PaymentModel.deleteMany({ invoiceId: invoice._id });
+    } catch (paymentError) {
+      paymentRemoved = false;
+      logger.error({ err: paymentError, invoiceId: String(invoice._id) }, 'تعذر حذف دفعة بيع POS الفاشل');
+    }
+
+    if (paymentRemoved) {
+      try {
+        await rollbackPosSaleStock({
+          invoiceId: invoice._id,
+          invoiceNumber: invoice.invoiceNumber,
+          organizationId: ctx!.organizationId,
+          branchId: invoice.branchId ?? null,
+          actorId: auth.userId,
+          actorName: auth.fullName,
+        });
+        await InvoiceModel.deleteOne({ _id: invoice._id, status: 'draft' });
+      } catch (compensationError) {
+        logger.error(
+          { err: compensationError, invoiceId: String(invoice._id) },
+          'فشل تعويض بيع POS — ستُعالج المسودة عند الإقلاع',
+        );
+      }
+    }
+
+    throw error;
+  }
 
   await recordAudit(
     {
-      action: 'payment',
+      action: isCredit ? 'create' : 'payment',
       resource: 'Invoice',
       resourceId: String(invoice._id),
-      summary: `بيع نقاط بيع ${invoice.invoiceNumber} بمبلغ ${totals.totalEgp} جنيه`,
+      summary: `بيع نقاط بيع ${invoice.invoiceNumber} بمبلغ ${totals.totalEgp} جنيه${isCredit ? ' (آجل)' : ''}`,
     },
     req,
   );
 
   return created(res, {
     invoice: invoice.toObject(),
-    payment: payment.toObject(),
+    payment,
     changeEgp: change,
     totals: invoice.totals,
   });
@@ -689,49 +888,78 @@ export const financeSummary = async (req: Request, res: Response) => {
   const range: Record<string, Date> = {};
   if (query.from) range.$gte = new Date(String(query.from));
   if (query.to) range.$lte = new Date(String(query.to));
+
+  /**
+   * لوحة الفواتير ترسل period بدل from/to. بدون دعمه هنا كان الملخص يعرض
+   * إجماليات كل الفترات مهما تغيّر الاختيار في الواجهة.
+   */
+  const period = String(query.period ?? '');
+  if (!query.from && !query.to && ['today', 'month', 'last30'].includes(period)) {
+    const now = new Date();
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+    if (period === 'today') {
+      range.$gte = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    } else if (period === 'month') {
+      range.$gte = new Date(now.getFullYear(), now.getMonth(), 1);
+    } else {
+      range.$gte = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
+    }
+    range.$lte = endOfToday;
+  }
+
   const hasRange = Object.keys(range).length > 0;
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
 
-  const match = hasRange ? { paidAt: range } : {};
+  const match = hasRange ? { ...branchMatch, paidAt: range } : branchMatch;
 
-  const [revenue, refunds, expenses, byMethod, unpaid, invoicedTotal] = await Promise.all([
+  const [revenue, refunds, supplierPayments, expenses, byMethod, unpaid, invoicedTotal] = await Promise.all([
     PaymentModel.aggregate<{ total: number }>([
       { $match: { ...match, direction: 'in' } },
       { $group: { _id: null, total: { $sum: '$amountEgp' } } },
     ]),
     PaymentModel.aggregate<{ total: number }>([
-      { $match: { ...match, direction: 'out' } },
+      { $match: { ...match, direction: 'out', isRefund: true } },
+      { $group: { _id: null, total: { $sum: '$amountEgp' } } },
+    ]),
+    PaymentModel.aggregate<{ total: number }>([
+      { $match: { ...match, direction: 'out', supplierId: { $ne: null } } },
       { $group: { _id: null, total: { $sum: '$amountEgp' } } },
     ]),
     ExpenseModel.aggregate<{ total: number }>([
-      { $match: hasRange ? { incurredAt: range } : {} },
+      { $match: { ...branchMatch, ...(hasRange ? { incurredAt: range } : {}) } },
       { $group: { _id: null, total: { $sum: '$amountEgp' } } },
     ]),
     PaymentModel.aggregate<{ _id: string; total: number; count: number }>([
-      { $match: match },
+      { $match: { ...match, direction: 'in' } },
       { $group: { _id: '$method', total: { $sum: '$amountEgp' }, count: { $sum: 1 } } },
       { $sort: { total: -1 } },
     ]),
     InvoiceModel.aggregate<{ due: number; count: number }>([
-      { $match: { 'totals.dueEgp': { $gt: 0.009 }, status: { $nin: ['void', 'draft'] } } },
+      { $match: { ...branchMatch, 'totals.dueEgp': { $gt: 0.009 }, status: { $nin: ['void', 'draft'] } } },
       { $group: { _id: null, due: { $sum: '$totals.dueEgp' }, count: { $sum: 1 } } },
     ]),
     InvoiceModel.aggregate<{ total: number }>([
-      { $match: { ...(hasRange ? { issuedAt: range } : {}), status: { $nin: ['void', 'draft'] } } },
+      { $match: { ...branchMatch, ...(hasRange ? { issuedAt: range } : {}), status: { $nin: ['void', 'draft'] } } },
       { $group: { _id: null, total: { $sum: '$totals.totalEgp' } } },
     ]),
   ]);
 
   const revenueTotal = money(revenue[0]?.total ?? 0);
   const refundTotal = money(refunds[0]?.total ?? 0);
+  const supplierPaymentsTotal = money(supplierPayments[0]?.total ?? 0);
   const expenseTotal = money(expenses[0]?.total ?? 0);
+  const netRevenue = money(revenueTotal - refundTotal);
 
   return ok(res, {
     period: { from: range.$gte ?? null, to: range.$lte ?? null },
     revenueEgp: revenueTotal,
     refundsEgp: refundTotal,
-    netRevenueEgp: money(revenueTotal - refundTotal),
+    netRevenueEgp: netRevenue,
     expensesEgp: expenseTotal,
-    profitEgp: money(revenueTotal - refundTotal - expenseTotal),
+    supplierPaymentsEgp: supplierPaymentsTotal,
+    profitEgp: money(netRevenue - expenseTotal),
+    netCashFlowEgp: money(netRevenue - expenseTotal - supplierPaymentsTotal),
     invoicedTotalEgp: money(invoicedTotal[0]?.total ?? 0),
     receivablesEgp: money(unpaid[0]?.due ?? 0),
     unpaidInvoicesCount: unpaid[0]?.count ?? 0,

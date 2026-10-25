@@ -1,13 +1,33 @@
 'use client';
 
+import { useState } from 'react';
 import useSWR from 'swr';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
-import { ArrowRight, Camera, Phone, ShieldCheck, Smartphone, Wrench, AlertTriangle } from 'lucide-react';
-import { errorMessage, fetcher } from '@/lib/api';
-import { formatDateTime, formatMoney, maskImei, timeAgo } from '@/lib/format';
+import { ArrowRight, Camera, FileText, Phone, Printer, ShieldCheck, Smartphone, Wrench, AlertTriangle } from 'lucide-react';
+import { api, errorMessage, fetcher } from '@/lib/api';
+import { formatDate, formatDateTime, formatMoney, maskImei, timeAgo } from '@/lib/format';
 import { STATUS_COLORS, statusLabel, type RepairStatus } from '@/lib/constants';
 import { Badge, Card, CardHeader, EmptyState, LoadingBlock, PageHeader } from '@/components/ui';
+import { Modal } from '@/components/ui/Modal';
+import { useToast } from '@/components/ui/Toast';
+import { useAuth } from '@/lib/auth';
+
+interface CustomerStatement {
+  customer: { id: string; fullName: string; phone?: string; code?: string };
+  period: { from: string; to: string };
+  openingBalanceEgp: number;
+  closingBalanceEgp: number;
+  entries: {
+    date: string;
+    kind: string;
+    reference: string;
+    description: string;
+    debitEgp: number;
+    creditEgp: number;
+    balanceEgp: number;
+  }[];
+}
 
 interface CustomerDetail {
   _id: string;
@@ -49,7 +69,27 @@ interface CustomerDetail {
 
 export default function CustomerDetailPage() {
   const params = useParams<{ id: string }>();
+  const toast = useToast();
+  const { hasPermission } = useAuth();
   const { data, error, isLoading } = useSWR<CustomerDetail>(params?.id ? `/customers/${params.id}` : null, fetcher);
+  const [statementOpen, setStatementOpen] = useState(false);
+  const [statement, setStatement] = useState<CustomerStatement | null>(null);
+  const [statementLoading, setStatementLoading] = useState(false);
+
+  const openStatement = async () => {
+    if (!params?.id) return;
+    setStatementOpen(true);
+    setStatement(null);
+    setStatementLoading(true);
+    try {
+      const result = await api.get<CustomerStatement>(`/finance/customers/${params.id}/statement`);
+      setStatement(result);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setStatementLoading(false);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -87,6 +127,11 @@ export default function CustomerDetailPage() {
               >
                 واتساب
               </a>
+            ) : null}
+            {hasPermission('payment:read') ? (
+              <button type="button" className="btn-secondary" onClick={() => void openStatement()}>
+                <FileText size={15} /> كشف حساب
+              </button>
             ) : null}
           </>
         }
@@ -290,6 +335,89 @@ export default function CustomerDetailPage() {
           <p className="px-1 text-[11px] text-ink-400">آخر تحديث: {timeAgo(new Date())}</p>
         </div>
       </div>
+
+      <Modal
+        open={statementOpen}
+        onClose={() => {
+          setStatementOpen(false);
+          setStatement(null);
+        }}
+        title={`كشف حساب — ${data.fullName}`}
+        subtitle={statement ? `من ${formatDate(statement.period.from)} إلى ${formatDate(statement.period.to)}` : undefined}
+        size="lg"
+        footer={
+          <>
+            <button type="button" className="btn-secondary" onClick={() => window.print()}>
+              <Printer size={15} /> طباعة
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => {
+                setStatementOpen(false);
+                setStatement(null);
+              }}
+            >
+              إغلاق
+            </button>
+          </>
+        }
+      >
+        {statementLoading ? (
+          <LoadingBlock rows={6} />
+        ) : statement ? (
+          <div id="print-area" className="space-y-3">
+            <div className="grid gap-2 rounded-xl border border-ink-100 bg-ink-50 p-3 text-xs sm:grid-cols-3">
+              <div>
+                <p className="text-ink-500">رصيد افتتاحي</p>
+                <p className="num mt-0.5 font-bold">{formatMoney(statement.openingBalanceEgp)}</p>
+              </div>
+              <div>
+                <p className="text-ink-500">إجمالي المدين</p>
+                <p className="num mt-0.5 font-bold">{formatMoney(statement.entries.reduce((acc, e) => acc + e.debitEgp, 0))}</p>
+              </div>
+              <div>
+                <p className="text-ink-500">الرصيد الختامي</p>
+                <p className="num mt-0.5 font-bold text-red-700">{formatMoney(statement.closingBalanceEgp)}</p>
+              </div>
+            </div>
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>التاريخ</th>
+                    <th>المستند</th>
+                    <th>البيان</th>
+                    <th>مدين</th>
+                    <th>دائن</th>
+                    <th>الرصيد</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {statement.entries.length ? (
+                    statement.entries.map((entry, index) => (
+                      <tr key={`${entry.reference}-${index}`}>
+                        <td className="text-xs">{formatDate(entry.date)}</td>
+                        <td className="text-xs font-medium" dir="ltr">{entry.reference}</td>
+                        <td className="text-xs">{entry.description}</td>
+                        <td className="num text-xs">{entry.debitEgp ? formatMoney(entry.debitEgp) : '—'}</td>
+                        <td className="num text-xs text-emerald-700">{entry.creditEgp ? formatMoney(entry.creditEgp) : '—'}</td>
+                        <td className="num text-xs font-semibold">{formatMoney(entry.balanceEgp)}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={6}>
+                        <EmptyState title="لا توجد حركات في الفترة" icon={<FileText size={20} />} />
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
 }

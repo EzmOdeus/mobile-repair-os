@@ -27,6 +27,10 @@ export function effectForMovementType(type: StockMovementType, quantity: number)
     case 'transfer_in':
     case 'repair_return':
       return { onHand: q * sign };
+    case 'purchase_order':
+      return { incoming: q };
+    case 'purchase_cancel':
+      return { incoming: -q };
     case 'sale_out':
     case 'adjustment_out':
     case 'transfer_out':
@@ -52,6 +56,8 @@ export interface ApplyStockInput {
   type: StockMovementType;
   quantity: number;
   unitCostEgp?: number;
+  /** تعديل متزامن على كمية «الوارد المتوقع» مع نفس الحركة (استلام أمر شراء) */
+  incomingDelta?: number;
   supplierId?: string | Types.ObjectId | null;
   batchId?: string | Types.ObjectId | null;
   batchCode?: string;
@@ -83,7 +89,10 @@ export async function applyStockMovement(input: ApplyStockInput) {
   if (!ctx) throw ApiError.forbidden('لا يمكن تعديل المخزون بدون سياق مؤسسة');
 
   const branchId = input.branchId ?? ctx.branchId;
-  const effect = effectForMovementType(input.type, input.quantity);
+  const effect = {
+    ...effectForMovementType(input.type, input.quantity),
+    ...(input.incomingDelta !== undefined ? { incoming: input.incomingDelta } : {}),
+  };
 
   const part = await PartModel.findById(input.partId).select('name sku stock pricing warranty').lean();
   if (!part) throw ApiError.notFound('القطعة غير موجودة');
@@ -93,6 +102,7 @@ export async function applyStockMovement(input: ApplyStockInput) {
   const dOnHand = effect.onHand ?? 0;
   const dReserved = effect.reserved ?? 0;
   const dDefective = effect.defective ?? 0;
+  const dIncoming = effect.incoming ?? 0;
 
   const balanceUpdate = {
     $inc: {
@@ -120,6 +130,9 @@ export async function applyStockMovement(input: ApplyStockInput) {
     if (dDefective < 0) {
       guards.push({ $expr: { $gte: [{ $add: [{ $ifNull: ['$quantity.defective', 0] }, dDefective] }, 0] } });
     }
+    if (dIncoming < 0) {
+      guards.push({ $expr: { $gte: [{ $add: [{ $ifNull: ['$quantity.incoming', 0] }, dIncoming] }, 0] } });
+    }
     // لا يجوز أن يتجاوز المحجوز الموجود بعد العملية
     if (dOnHand < 0 || dReserved > 0) {
       guards.push({
@@ -134,7 +147,7 @@ export async function applyStockMovement(input: ApplyStockInput) {
   }
 
   /** يحدد سبب فشل شرط الكفاية (أو null إذا كانت القيم تغيّرت فقط) */
-  const availabilityError = (onHand: number, reserved: number, defective: number): ApiError | null => {
+  const availabilityError = (onHand: number, reserved: number, defective: number, incoming = 0): ApiError | null => {
     const nextOnHand = onHand + dOnHand;
     const nextReserved = reserved + dReserved;
 
@@ -157,6 +170,13 @@ export async function applyStockMovement(input: ApplyStockInput) {
         partId: String(partObjectId),
         defective,
         requested: Math.abs(dDefective),
+      });
+    }
+    if (dIncoming < 0 && incoming + dIncoming < 0) {
+      return ApiError.businessRule(`الكمية الواردة المتوقعة من «${part.name}» غير كافية (المتوقع: ${incoming})`, {
+        partId: String(partObjectId),
+        incoming,
+        requested: Math.abs(dIncoming),
       });
     }
     if (nextOnHand < nextReserved) {
@@ -195,13 +215,14 @@ export async function applyStockMovement(input: ApplyStockInput) {
         current.quantity?.onHand ?? 0,
         current.quantity?.reserved ?? 0,
         current.quantity?.defective ?? 0,
+        current.quantity?.incoming ?? 0,
       );
       if (error) throw error;
       continue; // القيم تغيّرت بين التحديث والقراءة — دورة جديدة
     }
 
     // لا يوجد سجل بعد: نتحقق من الصفر ثم ننشئه
-    const freshError = availabilityError(0, 0, 0);
+    const freshError = availabilityError(0, 0, 0, 0);
     if (freshError) throw freshError;
     try {
       item = await InventoryItemModel.findOneAndUpdate({ partId: partObjectId, branchId }, balanceUpdate, {
@@ -279,10 +300,10 @@ export async function applyStockMovement(input: ApplyStockInput) {
     quantity: input.quantity,
     effect,
     balanceAfter: {
-      onHand: updatedPart?.stock?.onHand ?? 0,
-      reserved: updatedPart?.stock?.reserved ?? 0,
-      defective: updatedPart?.stock?.defective ?? 0,
-      incoming: updatedPart?.stock?.incoming ?? 0,
+      onHand: item.quantity?.onHand ?? 0,
+      reserved: item.quantity?.reserved ?? 0,
+      defective: item.quantity?.defective ?? 0,
+      incoming: item.quantity?.incoming ?? 0,
     },
     unitCostEgp: unitCost,
     totalCostEgp: money(Math.abs(input.quantity) * unitCost),

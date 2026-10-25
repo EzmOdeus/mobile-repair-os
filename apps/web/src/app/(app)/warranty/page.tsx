@@ -3,10 +3,10 @@
 import { useState } from 'react';
 import useSWR, { mutate } from 'swr';
 import Link from 'next/link';
-import { AlertTriangle, Package, ShieldCheck, TrendingDown, Wrench } from 'lucide-react';
+import { AlertTriangle, Package, Plus, Search, ShieldCheck, TrendingDown, Wrench } from 'lucide-react';
 import { api, errorMessage, fetcher, qs } from '@/lib/api';
 import { formatDateTime, formatMoney, formatNumber, formatPercent } from '@/lib/format';
-import { WARRANTY_STATUS_LABELS } from '@/lib/constants';
+import { FAULT_CATEGORY_LABELS, WARRANTY_STATUS_LABELS } from '@/lib/constants';
 import { Badge, Card, CardHeader, EmptyState, Field, LoadingBlock, PageHeader, StatCard } from '@/components/ui';
 import { Modal } from '@/components/ui/Modal';
 import { useToast } from '@/components/ui/Toast';
@@ -43,6 +43,10 @@ interface ClaimRow {
   repairCostEgp: number;
   chargedToCustomerEgp: number;
   chargedToSupplierEgp: number;
+  decisionNotes?: string;
+  rejectedReason?: string;
+  supplierClaimStatus?: string;
+  resolutionNotes?: string;
   customerId?: { fullName: string; phone: string } | null;
   deviceId?: { brand: string; model: string } | null;
   originalTicketId?: { ticketNumber: string } | null;
@@ -68,25 +72,34 @@ export default function WarrantyPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [page, setPage] = useState(1);
   const [selectedClaim, setSelectedClaim] = useState<ClaimRow | null>(null);
+  const [openClaim, setOpenClaim] = useState(false);
 
   const claimsKey = `/warranty/claims${qs({ status: statusFilter || undefined, page, limit: 20 })}`;
   const { data: claims, error, isLoading } = useSWR<{ items: ClaimRow[]; meta: { total: number; page: number; pages: number } }>(
     tab === 'claims' ? claimsKey : null,
     fetcher,
   );
-  const { data: intel } = useSWR<WarrantyIntelligence>(tab === 'intelligence' ? '/warranty/intelligence' : null, fetcher);
-  const { data: failing } = useSWR<FailingPart[]>(tab === 'intelligence' ? '/warranty/failing-parts' : null, fetcher);
+  // بطاقات الإحصاء ظاهرة في التبويبين، لذا تُجلب دائمًا وليست مرتبطة بتبويب التحليلات
+  const { data: intel } = useSWR<WarrantyIntelligence>('/warranty/intelligence', fetcher);
+  const { data: failing } = useSWR<FailingPart[]>('/warranty/failing-parts', fetcher);
 
   return (
     <div>
       <PageHeader
-        title="الضمان والclaims"
+        title="الضمان والمطالبات"
         subtitle="قياس معدلات العودة وربطها بالقطعة والفني والموديل"
+        actions={
+          hasPermission('warranty:manage') ? (
+            <button type="button" className="btn-primary" onClick={() => setOpenClaim(true)}>
+              <Plus size={16} /> فتح مطالبة ضمان
+            </button>
+          ) : null
+        }
       />
 
       <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label="إجمالي claims الضمان"
+          label="إجمالي مطالبات الضمان"
           value={formatNumber(claims?.meta.total ?? intel?.totalClaims ?? 0)}
           icon={<ShieldCheck size={18} />}
           tone="info"
@@ -116,7 +129,7 @@ export default function WarrantyPage() {
       <Card className="mb-4">
         <div className="flex flex-wrap items-center gap-2 border-b border-ink-100 px-3 py-2">
           {[
-            ['claims', 'قائمة claims'],
+            ['claims', 'قائمة المطالبات'],
             ['intelligence', 'تحليلات الضمان'],
           ].map(([value, label]) => (
             <button
@@ -151,7 +164,7 @@ export default function WarrantyPage() {
           <div className="card-pad space-y-5">
             <div className="grid gap-4 lg:grid-cols-2">
               <div>
-                <h3 className="mb-2 text-sm font-bold text-ink-800">توزيع claims حسب الحالة</h3>
+                <h3 className="mb-2 text-sm font-bold text-ink-800">توزيع المطالبات حسب الحالة</h3>
                 <div className="space-y-1.5">
                   {intel?.byStatus?.map((row) => (
                     <div key={row.status} className="flex items-center justify-between rounded-lg border border-ink-200 px-3 py-2 text-xs">
@@ -191,7 +204,7 @@ export default function WarrantyPage() {
                   <thead>
                     <tr>
                       <th>الفني</th>
-                      <th>claims</th>
+                      <th>المطالبات</th>
                       <th>نفس العطل</th>
                       <th>متوسط الأيام حتى العودة</th>
                     </tr>
@@ -214,7 +227,7 @@ export default function WarrantyPage() {
             </div>
 
             <div>
-              <h3 className="mb-2 text-sm font-bold text-ink-800">قطع تحتاج مراجعة المورد (Parts Quality Intelligence)</h3>
+              <h3 className="mb-2 text-sm font-bold text-ink-800">قطع تحتاج مراجعة المورد</h3>
               <div className="table-wrap">
                 <table className="table">
                   <thead>
@@ -276,7 +289,7 @@ export default function WarrantyPage() {
                     >
                       <span className="block font-medium text-ink-800">{device.device}</span>
                       <span className="block text-[11px] text-ink-500">
-                        {device.claims} claim · نفس العطل {device.sameFaultClaims}
+                        {device.claims} مطالبة · نفس العطل {device.sameFaultClaims}
                       </span>
                     </Link>
                   ))}
@@ -296,7 +309,7 @@ export default function WarrantyPage() {
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>رقم claim</th>
+                      <th>رقم المطالبة</th>
                       <th>العميل</th>
                       <th>الجهاز</th>
                       <th>التذكرة الأصلية</th>
@@ -367,7 +380,7 @@ export default function WarrantyPage() {
                     ) : (
                       <tr>
                         <td colSpan={9}>
-                          <EmptyState title="لا توجد claims" icon={<ShieldCheck size={22} />} />
+                          <EmptyState title="لا توجد مطالبات" icon={<ShieldCheck size={22} />} />
                         </td>
                       </tr>
                     )}
@@ -400,7 +413,20 @@ export default function WarrantyPage() {
         )}
       </Card>
 
+      {openClaim ? (
+        <OpenClaimModal
+          onClose={() => setOpenClaim(false)}
+          onDone={async (claimNumber) => {
+            setOpenClaim(false);
+            await Promise.all([mutate(claimsKey), mutate('/warranty/intelligence')]);
+            toast.success(`تم فتح مطالبة الضمان ${claimNumber}`);
+          }}
+          onError={(message) => toast.error(message)}
+        />
+      ) : null}
+
       <ClaimDecisionModal
+        key={selectedClaim?._id ?? 'none'}
         claim={selectedClaim}
         onClose={() => setSelectedClaim(null)}
         onDone={async () => {
@@ -429,22 +455,26 @@ function ClaimDecisionModal({
   onDone: () => void | Promise<void>;
   onError: (message: string) => void;
 }) {
-  const [form, setForm] = useState({
-    status: 'approved',
-    coverage: 'both',
-    decisionNotes: '',
-    rejectedReason: '',
-    repairCostEgp: '',
-    chargedToCustomerEgp: '0',
-    chargedToSupplierEgp: '0',
-    supplierClaimStatus: 'not_applicable',
-    resolutionNotes: '',
-  });
+  const [form, setForm] = useState(() => ({
+    status: claim && !['open', 'under_review'].includes(claim.status) ? claim.status : 'approved',
+    coverage: claim?.coverage ?? 'both',
+    decisionNotes: claim?.decisionNotes ?? '',
+    rejectedReason: claim?.rejectedReason ?? '',
+    repairCostEgp: claim?.repairCostEgp ? String(claim.repairCostEgp) : '',
+    chargedToCustomerEgp: String(claim?.chargedToCustomerEgp ?? 0),
+    chargedToSupplierEgp: String(claim?.chargedToSupplierEgp ?? 0),
+    supplierClaimStatus: claim?.supplierClaimStatus ?? 'not_applicable',
+    resolutionNotes: claim?.resolutionNotes ?? '',
+  }));
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   if (!claim) return null;
 
   const submit = async () => {
+    if (form.status === 'rejected' && !form.rejectedReason.trim()) {
+      onError('سبب الرفض مطلوب عند رفض المطالبة');
+      return;
+    }
     setIsSubmitting(true);
     try {
       await api.post(`/warranty/claims/${claim._id}/decide`, {
@@ -572,6 +602,243 @@ function ClaimDecisionModal({
           </Field>
         </div>
       </div>
+    </Modal>
+  );
+}
+
+interface DeliveredTicket {
+  _id: string;
+  ticketNumber: string;
+  status: string;
+  deliveredAt?: string | null;
+  warranty?: { policyDays?: number; startsAt?: string | null; expiresAt?: string | null; isVoid?: boolean } | null;
+  customerId?: { fullName?: string; phone?: string } | null;
+  deviceId?: { brand?: string; model?: string; imei?: string } | null;
+  assignedTechnicianId?: { fullName?: string } | null;
+}
+
+function OpenClaimModal({
+  onClose,
+  onDone,
+  onError,
+}: {
+  onClose: () => void;
+  onDone: (claimNumber: string) => void | Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [search, setSearch] = useState('');
+  const [ticket, setTicket] = useState<DeliveredTicket | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [form, setForm] = useState({
+    symptom: '',
+    coverage: 'both',
+    faultCategory: '',
+    isSameFault: true,
+    misuseSuspected: false,
+    physicalDamageFound: false,
+    liquidDamageFound: false,
+    thirdPartyIntervention: false,
+    createNewTicket: true,
+    priority: 'high',
+  });
+
+  const { data, isLoading } = useSWR<{ items: DeliveredTicket[] }>(
+    `/tickets${qs({ status: 'delivered,warranty', q: search || undefined, limit: 20, sort: '-updatedAt' })}`,
+    fetcher,
+  );
+
+  const submit = async () => {
+    if (!ticket) return onError('اختر التذكرة المُسلَّمة أولًا');
+    if (form.symptom.trim().length < 3) return onError('اكتب وصف العَرَض (٣ أحرف على الأقل)');
+    setIsSubmitting(true);
+    try {
+      const response = await api.post<{ claimNumber: string }>('/warranty/claims', {
+        originalTicketId: ticket._id,
+        symptom: form.symptom.trim(),
+        coverage: form.coverage,
+        faultCategory: form.faultCategory,
+        isSameFault: form.isSameFault,
+        misuseSuspected: form.misuseSuspected,
+        physicalDamageFound: form.physicalDamageFound,
+        liquidDamageFound: form.liquidDamageFound,
+        thirdPartyIntervention: form.thirdPartyIntervention,
+        createNewTicket: form.createNewTicket,
+        priority: form.priority,
+      });
+      await onDone(response.claimNumber);
+    } catch (err) {
+      onError(errorMessage(err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const expiry = ticket?.warranty?.expiresAt ? new Date(ticket.warranty.expiresAt) : null;
+  const warrantyActive = Boolean(expiry && expiry.getTime() > Date.now() && !ticket?.warranty?.isVoid);
+  const flagFields = [
+    ['isSameFault', 'نفس العطل السابق'],
+    ['misuseSuspected', 'اشتباه سوء استخدام'],
+    ['physicalDamageFound', 'تلف مادي ظاهر'],
+    ['liquidDamageFound', 'آثار سوائل'],
+    ['thirdPartyIntervention', 'تدخل فني خارجي'],
+    ['createNewTicket', 'إنشاء تذكرة عودة تلقائيًا'],
+  ] as const;
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="فتح مطالبة ضمان"
+      subtitle="اختر التذكرة المُسلَّمة ثم سجّل العَرَض"
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            إلغاء
+          </button>
+          <button type="button" className="btn-primary" onClick={() => void submit()} disabled={isSubmitting || !ticket}>
+            {isSubmitting ? 'جارٍ الفتح…' : 'فتح المطالبة'}
+          </button>
+        </>
+      }
+    >
+      {!ticket ? (
+        <div className="space-y-3">
+          <div className="relative">
+            <Search size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-ink-400" />
+            <input
+              className="input pr-9"
+              placeholder="ابحث برقم التذكرة أو اسم العميل…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
+          {isLoading ? (
+            <LoadingBlock rows={3} />
+          ) : data?.items?.length ? (
+            <div className="max-h-80 space-y-2 overflow-y-auto">
+              {data.items.map((item) => {
+                const itemExpiry = item.warranty?.expiresAt ? new Date(item.warranty.expiresAt) : null;
+                const active = Boolean(itemExpiry && itemExpiry.getTime() > Date.now() && !item.warranty?.isVoid);
+                return (
+                  <button
+                    key={item._id}
+                    type="button"
+                    onClick={() => setTicket(item)}
+                    className="w-full rounded-xl border border-ink-200 p-3 text-right transition hover:border-brand-400 hover:bg-brand-50/40"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-xs font-bold text-ink-900" dir="ltr">
+                          {item.ticketNumber}
+                        </p>
+                        <p className="mt-0.5 text-xs text-ink-700">
+                          {item.customerId?.fullName ?? '—'} · {item.deviceId?.brand ?? ''} {item.deviceId?.model ?? ''}
+                        </p>
+                      </div>
+                      <Badge
+                        className={
+                          active
+                            ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                            : 'border-ink-200 bg-ink-50 text-ink-500'
+                        }
+                      >
+                        {active ? 'ضمان ساري' : 'خارج الضمان'}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 text-[11px] text-ink-400">
+                      {item.deliveredAt ? `سُلِّمت في ${formatDateTime(item.deliveredAt)}` : 'لا يوجد تاريخ تسليم'}
+                      {itemExpiry ? ` · ينتهي ${formatDateTime(itemExpiry)}` : ''}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <EmptyState title="لا توجد تذاكر مُسلَّمة مطابقة" icon={<ShieldCheck size={20} />} />
+          )}
+          <p className="rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-[11px] leading-relaxed text-amber-800">
+            يُسمح بفتح مطالبة واحدة مفتوحة لكل تذكرة. المطالبات خارج فترة الضمان تُسجَّل أيضًا لأغراض المتابعة، لكن دون تغطية تلقائية.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="rounded-xl border border-brand-200 bg-brand-50/50 p-3">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <p className="text-xs font-bold text-ink-900" dir="ltr">
+                  {ticket.ticketNumber}
+                </p>
+                <p className="mt-0.5 text-xs text-ink-700">
+                  {ticket.customerId?.fullName ?? '—'} · {ticket.deviceId?.brand ?? ''} {ticket.deviceId?.model ?? ''}
+                </p>
+                <p className="mt-1 text-[11px] text-ink-500">
+                  {warrantyActive ? 'الضمان ساري' : 'الضمان منتهٍ أو ملغى'}
+                  {ticket.assignedTechnicianId?.fullName ? ` · الفني: ${ticket.assignedTechnicianId.fullName}` : ''}
+                </p>
+              </div>
+              <button type="button" className="btn-ghost text-xs" onClick={() => setTicket(null)}>
+                تغيير التذكرة
+              </button>
+            </div>
+          </div>
+
+          <Field label="وصف العَرَض" required>
+            <textarea
+              className="input min-h-[4rem]"
+              value={form.symptom}
+              onChange={(e) => setForm({ ...form, symptom: e.target.value })}
+              placeholder="مثال: الشاشة تعمل لكن اللمس لا يستجيب في الجزء السفلي"
+            />
+          </Field>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="التغطية المطلوبة">
+              <select className="input" value={form.coverage} onChange={(e) => setForm({ ...form, coverage: e.target.value })}>
+                <option value="both">قطعة + مصنعية</option>
+                <option value="part">قطعة فقط</option>
+                <option value="labor">مصنعية فقط</option>
+                <option value="none">بدون تغطية</option>
+              </select>
+            </Field>
+            <Field label="تصنيف العطل">
+              <select
+                className="input"
+                value={form.faultCategory}
+                onChange={(e) => setForm({ ...form, faultCategory: e.target.value })}
+              >
+                <option value="">غير محدد</option>
+                {Object.entries(FAULT_CATEGORY_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="أولوية تذكرة العودة">
+              <select className="input" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })}>
+                <option value="normal">عادية</option>
+                <option value="high">عالية</option>
+                <option value="urgent">عاجلة</option>
+                <option value="low">منخفضة</option>
+              </select>
+            </Field>
+          </div>
+
+          <div className="grid gap-2 rounded-xl border border-ink-200 p-3 sm:grid-cols-2">
+            {flagFields.map(([key, label]) => (
+              <label key={key} className="flex items-center gap-2 text-xs text-ink-700">
+                <input
+                  type="checkbox"
+                  checked={form[key]}
+                  onChange={(e) => setForm({ ...form, [key]: e.target.checked })}
+                />
+                {label}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
     </Modal>
   );
 }

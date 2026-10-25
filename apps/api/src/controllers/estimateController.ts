@@ -10,7 +10,7 @@ import { OrganizationModel } from '../models/Organization.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok, paginated } from '../utils/asyncHandler.js';
 import { parseListQuery } from '../utils/queryHelpers.js';
-import { getAuth } from '../middleware/auth.js';
+import { branchFilter, getAuth, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { computeTotals, money } from '../utils/money.js';
@@ -55,6 +55,8 @@ export const listEstimates = async (req: Request, res: Response) => {
   if (query.ticketId) filter.ticketId = query.ticketId;
   if (query.status) filter.status = query.status;
   if (query.customerId) filter.customerId = query.customerId;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
 
   const [items, total] = await Promise.all([
     EstimateModel.find(filter)
@@ -77,6 +79,7 @@ export const getEstimate = async (req: Request, res: Response) => {
     .populate('lines.partId', 'name sku category')
     .lean();
   if (!estimate) throw ApiError.notFound('عرض السعر غير موجود');
+  requireBranchAccess(req, estimate.branchId);
 
   const approvals = await ApprovalModel.find({ estimateId: estimate._id }).sort({ decidedAt: -1 }).lean();
   return ok(res, { estimate, approvals });
@@ -92,6 +95,7 @@ export const createEstimate = async (req: Request, res: Response) => {
   };
 
   const ticket = await getTicketOrFail(body.ticketId);
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -217,6 +221,7 @@ export const updateEstimate = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const estimate = await EstimateModel.findById(req.params.id);
   if (!estimate) throw ApiError.notFound('عرض السعر غير موجود');
+  requireBranchAccess(req, estimate.branchId);
   if (['approved', 'partially_approved'].includes(estimate.status)) {
     throw ApiError.businessRule('لا يمكن تعديل عرض سعر تم اعتماده من العميل');
   }
@@ -257,6 +262,7 @@ export const sendEstimate = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const estimate = await EstimateModel.findById(req.params.id);
   if (!estimate) throw ApiError.notFound('عرض السعر غير موجود');
+  requireBranchAccess(req, estimate.branchId);
 
   const { via = 'whatsapp' } = req.body as { via?: string; message?: string };
   const ticket = await getRepairTicketForEstimate(String(estimate.ticketId));
@@ -339,6 +345,7 @@ export const decideEstimate = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const estimate = await EstimateModel.findById(req.params.id);
   if (!estimate) throw ApiError.notFound('عرض السعر غير موجود');
+  requireBranchAccess(req, estimate.branchId);
 
   const body = req.body as {
     decision: 'approved' | 'partially_approved' | 'rejected' | 'no_response';
@@ -419,6 +426,7 @@ export const decideEstimate = async (req: Request, res: Response) => {
     ticketDoc.cost.discountEgp = estimate.totals.discountEgp;
     if (body.decision === 'approved' || body.decision === 'partially_approved') {
       ticketDoc.cost.totalFinalEgp = approvedTotal;
+      ticketDoc.cost.dueEgp = money(Math.max(0, approvedTotal - (ticketDoc.cost.paidEgp ?? 0)));
     }
 
     // فترة السماح للضمان من العرض

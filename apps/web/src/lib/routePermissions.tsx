@@ -4,15 +4,23 @@ import {
   BarChart3,
   Bell,
   BookOpen,
+  Calculator,
+  Globe,
   ClipboardCheck,
   HardHat,
   LayoutDashboard,
   Package,
   Receipt,
+  ScrollText,
   Settings,
   ShieldCheck,
+  ShoppingBag,
+  ShoppingCart,
   Smartphone,
+  Store,
+  TrendingUp,
   Users,
+  Wallet,
   Wrench,
 } from 'lucide-react';
 
@@ -53,6 +61,8 @@ export function homePathForRole(role?: Role | null): string {
       return '/tickets';
     case 'accountant':
       return '/invoices';
+    case 'platform':
+      return '/platform';
     default:
       return '/dashboard';
   }
@@ -132,6 +142,14 @@ export const NAV_GROUPS: NavGroup[] = [
         roles: QUALITY_ROLES,
         description: 'فحوص الجودة قبل التسليم',
       },
+      {
+        href: '/pos',
+        label: 'نقاط البيع',
+        icon: <Store size={18} />,
+        permission: 'pos:operate',
+        roles: ['owner', 'admin', 'manager', 'receptionist', 'accountant'],
+        description: 'بيع مباشر من المخزون وتحصيل فوري',
+      },
     ],
   },
   {
@@ -161,6 +179,35 @@ export const NAV_GROUPS: NavGroup[] = [
         roles: INVENTORY_ROLES,
         description: 'القطع وأرصدة الفروع',
       },
+      {
+        href: '/purchases',
+        label: 'المشتريات والموردون',
+        icon: <ShoppingCart size={18} />,
+        permission: 'purchase:read',
+        roles: INVENTORY_ROLES,
+        description: 'أوامر الشراء والاستلام وحسابات الموردين',
+      },
+    ],
+  },
+  {
+    title: 'السوق والبورصة',
+    items: [
+      {
+        href: '/market',
+        label: 'ماركت بلس',
+        icon: <ShoppingBag size={18} />,
+        permission: 'market:read',
+        roles: NOT_TECHNICIAN,
+        description: 'بيع وشراء الأجهزة بين المراكز والمحلات',
+      },
+      {
+        href: '/market/prices',
+        label: 'بورصة الأسعار',
+        icon: <TrendingUp size={18} />,
+        permission: 'market:read',
+        roles: NOT_TECHNICIAN,
+        description: 'دليل الأسعار ومؤشر السوق وتقييم الأجهزة',
+      },
     ],
   },
   {
@@ -173,6 +220,14 @@ export const NAV_GROUPS: NavGroup[] = [
         permission: 'invoice:read',
         roles: NOT_TECHNICIAN,
         description: 'الفواتير والتحصيل',
+      },
+      {
+        href: '/shifts',
+        label: 'الورديات والخزينة',
+        icon: <Wallet size={18} />,
+        permission: 'shift:read',
+        roles: NOT_TECHNICIAN,
+        description: 'فتح وإغلاق الورديات ومطابقة النقد',
       },
       {
         href: '/warranty',
@@ -188,6 +243,43 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: <BarChart3 size={18} />,
         permission: 'analytics:read',
         description: 'التقارير ومؤشرات الأداء',
+      },
+      {
+        href: '/reports',
+        label: 'التقارير المالية',
+        icon: <Calculator size={18} />,
+        permission: 'report:read',
+        roles: NOT_TECHNICIAN,
+        description: 'الأرباح والخسائر والضريبة وأعمار الديون',
+      },
+    ],
+  },
+  {
+    title: 'إدارة المنصة',
+    items: [
+      {
+        href: '/platform',
+        label: 'لوحة المنصة',
+        icon: <Globe size={18} />,
+        permission: 'platform:orgs:read',
+        roles: ['platform'],
+        description: 'كل المراكز وحالات الاشتراك والإحصاءات',
+      },
+      {
+        href: '/platform/market',
+        label: 'مراجعة ماركت بلس',
+        icon: <ShoppingBag size={18} />,
+        permission: 'market:moderate',
+        roles: ['platform'],
+        description: 'اعتماد أو رفض الإعلانات العامة',
+      },
+      {
+        href: '/platform/prices',
+        label: 'دليل أسعار السوق',
+        icon: <TrendingUp size={18} />,
+        permission: 'market:prices:manage',
+        roles: ['platform'],
+        description: 'إدارة دليل الأسعار المرجعي للأجهزة',
       },
     ],
   },
@@ -218,6 +310,14 @@ export const NAV_GROUPS: NavGroup[] = [
         permission: 'org:update',
         anyOf: ['org:update', 'branch:manage', 'user:manage'],
         description: 'بيانات المركز والفروع والمستخدمون',
+      },
+      {
+        href: '/audit',
+        label: 'سجل التدقيق',
+        icon: <ScrollText size={18} />,
+        permission: 'audit:read',
+        roles: ['owner', 'admin', 'accountant'],
+        description: 'كل العمليات الحساسة ومن قام بها',
       },
     ],
   },

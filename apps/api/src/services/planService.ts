@@ -5,6 +5,7 @@ import { BranchModel } from '../models/Branch.js';
 import { RepairTicketModel } from '../models/RepairTicket.js';
 import { ApiError } from '../utils/ApiError.js';
 import { planLimits, RESOURCE_LABELS_AR, type PlanLimits } from '../constants/plans.js';
+import { assertSubscriptionActive } from './subscriptionService.js';
 import { monthRange } from '../utils/dates.js';
 
 export interface PlanUsage {
@@ -83,6 +84,7 @@ function limitReached(resource: keyof typeof RESOURCE_LABELS_AR, used: number, l
 
 /** يتحقق من حد المستخدمين — يُنادى قبل إنشاء أي مستخدم */
 export async function assertUserLimit(organizationId: Types.ObjectId | string): Promise<void> {
+  await assertSubscriptionActive(organizationId);
   const usage = await getPlanUsage(organizationId);
   if (usage.users.used >= usage.users.limit) {
     throw limitReached('users', usage.users.used, usage.users.limit, usage.plan.nameAr);
@@ -91,6 +93,7 @@ export async function assertUserLimit(organizationId: Types.ObjectId | string): 
 
 /** يتحقق من حد الفروع — يُنادى قبل إنشاء أي فرع */
 export async function assertBranchLimit(organizationId: Types.ObjectId | string): Promise<void> {
+  await assertSubscriptionActive(organizationId);
   const usage = await getPlanUsage(organizationId);
   if (usage.branches.used >= usage.branches.limit) {
     throw limitReached('branches', usage.branches.used, usage.branches.limit, usage.plan.nameAr);
@@ -102,6 +105,7 @@ export async function assertBranchLimit(organizationId: Types.ObjectId | string)
  * ملاحظة: نحسب التذاكر في الشهر الميلادي الجاري بتوقيت القاهرة.
  */
 export async function assertTicketLimit(organizationId: Types.ObjectId | string): Promise<void> {
+  await assertSubscriptionActive(organizationId);
   const usage = await getPlanUsage(organizationId);
   if (usage.monthlyTickets.used >= usage.monthlyTickets.limit) {
     throw limitReached(

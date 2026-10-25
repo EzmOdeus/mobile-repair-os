@@ -1,11 +1,12 @@
 import path from 'node:path';
-import fs from 'node:fs';
 import type { NextFunction, Request, Response } from 'express';
 import { Types } from 'mongoose';
 import { ApiError } from '../utils/ApiError.js';
 import { authenticate, getAuth } from './auth.js';
 import { StoredFileModel } from '../models/StoredFile.js';
-import { resolveUploadDir, verifyFileSignature } from '../services/storageService.js';
+import { verifyFileSignature } from '../services/storageService.js';
+import { getStorageDriver, resolveUploadDir } from '../services/storageDrivers.js';
+import { env } from '../config/env.js';
 import { runAsSystem } from '../context/tenantContext.js';
 import { logger } from '../config/logger.js';
 
@@ -79,16 +80,19 @@ export function uploadAuthorization(requiredPermission = 'evidence:read') {
         return next(ApiError.notFound('الملف غير موجود'));
       }
 
-      // 3) منع الهروب من المجلد (path traversal)
-      const uploadDir = resolveUploadDir();
-      const absolute = path.resolve(uploadDir, relative);
-      const normalizedRoot = path.resolve(uploadDir);
-      if (absolute !== normalizedRoot && !absolute.startsWith(normalizedRoot + path.sep)) {
-        logger.warn({ path: relative, absolute }, 'محاولة هروب من مجلد الملفات — مرفوضة');
-        return next(ApiError.notFound('الملف غير موجود'));
+      // 3) منع الهروب من المجلد (path traversal) — خاص بالمحرك المحلي فقط؛
+      // مفاتيح S3 لا تُفسَّر كمسارات نظام ملفات أصلًا
+      if (env.STORAGE_DRIVER === 'local') {
+        const uploadDir = resolveUploadDir();
+        const absolute = path.resolve(uploadDir, relative);
+        const normalizedRoot = path.resolve(uploadDir);
+        if (absolute !== normalizedRoot && !absolute.startsWith(normalizedRoot + path.sep)) {
+          logger.warn({ path: relative, absolute }, 'محاولة هروب من مجلد الملفات — مرفوضة');
+          return next(ApiError.notFound('الملف غير موجود'));
+        }
       }
 
-      if (!fs.existsSync(absolute) || !fs.statSync(absolute).isFile()) {
+      if (!(await getStorageDriver().exists(relative))) {
         return next(ApiError.notFound('الملف غير موجود'));
       }
 
@@ -120,20 +124,35 @@ export function uploadAuthorization(requiredPermission = 'evidence:read') {
  * أي احتمال لتقديم مسار لم يُفحص.
  */
 export function serveUploadedFile(req: Request, res: Response, next: NextFunction): void {
-  try {
-    const relative = decodeURIComponent(String(req.path ?? '').replace(/^\/+/, ''));
-    const absolute = path.resolve(resolveUploadDir(), relative);
+  void (async () => {
+    try {
+      const relative = decodeURIComponent(String(req.path ?? '').replace(/^\/+/, ''));
 
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.setHeader('Content-Disposition', 'inline');
+      // نوع المحتوى من سجل قاعدة البيانات، لا من الامتداد — نفس سياسة الرفع
+      const ownerOrgId = relative.split('/').filter(Boolean)[0] ?? '';
+      const stored = Types.ObjectId.isValid(ownerOrgId)
+        ? await runAsSystem(() =>
+            StoredFileModel.findOne({ organizationId: ownerOrgId, storageKey: relative })
+              .select('mimeType')
+              .lean(),
+          )
+        : null;
 
-    res.sendFile(absolute, { dotfiles: 'deny' }, (error) => {
-      if (!error) return;
-      if (error.message?.includes('ENOENT')) return next(ApiError.notFound('الملف غير موجود'));
-      return next(error);
-    });
-  } catch (error) {
-    next(error);
-  }
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.setHeader('Content-Disposition', 'inline');
+      if (stored?.mimeType) res.setHeader('Content-Type', stored.mimeType);
+
+      const stream = await getStorageDriver().getStream(relative);
+      stream.on('error', (err: Error) => {
+        if (!res.headersSent) return next(ApiError.notFound('الملف غير موجود'));
+        logger.error({ err, path: relative }, 'فشل أثناء تدفق الملف');
+        res.destroy();
+      });
+      stream.pipe(res);
+    } catch (error) {
+      if (error instanceof ApiError) return next(error);
+      next(error);
+    }
+  })();
 }

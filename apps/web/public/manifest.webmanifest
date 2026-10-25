@@ -1,0 +1,52 @@
+{
+  "id": "/",
+  "name": "Mobile Repair OS — إدارة مراكز الصيانة",
+  "short_name": "Repair OS",
+  "description": "تشغيل مراكز صيانة الهواتف: الاستلام، التشخيص، المخزون، الفحص، الضمان، والتحصيل.",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/dashboard",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f766e",
+  "categories": ["business", "productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "تذكرة جديدة",
+      "short_name": "تذكرة",
+      "description": "فتح شاشة استلام جهاز جديدة",
+      "url": "/tickets?new=1",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "مهامي",
+      "short_name": "مهامي",
+      "description": "مهام الفني الحالية",
+      "url": "/technician",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

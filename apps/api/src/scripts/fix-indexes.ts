@@ -15,7 +15,12 @@
  *    وهي الطريقة الصحيحة في MongoDB لتقييد التفرد على المستندات التي تحتوي قيمة
  *    فعلية (أدق من sparse لأنها تستثني null و'' أيضًا).
  *
- * 3) **فهارس قديمة من إصدارات سابقة** تُقارن بأسماء المخطط وتُحذف.
+ * 3) **فهارس قديمة أو بخيارات مختلفة عن المخطط**
+ *    المقارنة هنا لا تعتمد على الاسم وحده: فهرس موجود بنفس الحقول لكن بخيار
+ *    مختلف (unique مقابل غير فريد، أو partial مقابل كامل) عيب صامت لا يكتشفه
+ *    فحص الأسماء. لذلك تُقارن بصمة الحقول مع الخيارات الفعلية
+ *    (unique/sparse/partialFilterExpression/expireAfterSeconds) وتُعاد البناء
+ *    عند الاختلاف، مع حذف أي فهرس لا يعرّفه المخطط.
  *
  * التشغيل:
  *   node dist/scripts/fix-indexes.js          # إصلاح فعلي
@@ -49,16 +54,63 @@ const PARTIAL_INDEXES: { collection: string; indexName: string; partialFilterExp
   },
 ];
 
-/** أسماء الفهارس التي يعرفها المخطط لكل موديل */
-function schemaIndexNames(modelName: string): Set<string> {
-  const names = new Set<string>();
-  for (const [fields] of model(modelName).schema.indexes()) {
-    const parts = Object.entries(fields)
-      .map(([key, direction]) => `${key}_${typeof direction === 'number' ? direction : 1}`)
-      .sort();
-    names.add(parts.join('_'));
+type MeaningfulIndexOptions = {
+  unique: boolean;
+  sparse: boolean;
+  partialFilterExpression: Record<string, unknown> | null;
+  expireAfterSeconds: number | null;
+};
+
+/** بصمة الحقول بلا اسم الفهرس: الترتيب داخل الترويسة لا يغيّر الهوية */
+function keySignature(key: Record<string, unknown>): string {
+  return Object.entries(key)
+    .map(([field, direction]) => `${field}:${String(direction)}`)
+    .sort()
+    .join('|');
+}
+
+/** الخيارات المؤثرة في السلوك فقط — نتحاهل v/background/name وقيم بناء النص */
+function meaningfulOptions(options: Record<string, unknown> | undefined): MeaningfulIndexOptions {
+  return {
+    unique: options?.unique === true,
+    sparse: options?.sparse === true,
+    partialFilterExpression: (options?.partialFilterExpression as Record<string, unknown> | undefined) ?? null,
+    expireAfterSeconds: typeof options?.expireAfterSeconds === 'number' ? options.expireAfterSeconds : null,
+  };
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(',')}}`;
+}
+
+/** خريطة فهارس المخطط: بصمة الحقول → الحقول والخيارات المتوقعة */
+function schemaIndexes(modelName: string): Map<string, { key: Record<string, number>; options: MeaningfulIndexOptions }> {
+  const indexes = new Map<string, { key: Record<string, number>; options: MeaningfulIndexOptions }>();
+  for (const [key, options] of model(modelName).schema.indexes()) {
+    const numericKey = key as Record<string, number>;
+    indexes.set(keySignature(key as Record<string, unknown>), {
+      key: numericKey,
+      options: meaningfulOptions(options as Record<string, unknown> | undefined),
+    });
   }
-  return names;
+  return indexes;
+}
+
+/** خيارات إنشاء الفهرس من الشكل المطبع — لا نمرر null أو false بلا داعٍ */
+function createOptionsFrom(options: MeaningfulIndexOptions, name?: string): Record<string, unknown> {
+  const create: Record<string, unknown> = {};
+  if (name) create.name = name;
+  if (options.unique) create.unique = true;
+  if (options.sparse) create.sparse = true;
+  if (options.partialFilterExpression) create.partialFilterExpression = options.partialFilterExpression;
+  if (options.expireAfterSeconds != null) create.expireAfterSeconds = options.expireAfterSeconds;
+  return create;
 }
 
 async function main(): Promise<void> {
@@ -142,40 +194,84 @@ async function main(): Promise<void> {
     }
   }
 
-  /* ---------- 3) حذف الفهارس غير المعرّفة في المخطط ---------- */
+  /* ---------- 3) مطابقة الفهارس مع المخطط (الحقول + الخيارات) ---------- */
   const unknownIndexes: { model: string; collection: string; index: string }[] = [];
+  const optionMismatches: { model: string; collection: string; index: string; expected: MeaningfulIndexOptions }[] = [];
   let dropped = 0;
+  let rebuilt = 0;
 
   for (const modelName of modelNames()) {
     const target = model(modelName);
     const actual = await target.collection.indexes();
-    const expectedNormalized = new Set([...schemaIndexNames(modelName)].map((name) => name.split('_').sort().join('_')));
+    const expected = schemaIndexes(modelName);
 
     for (const index of actual) {
       const indexName = index.name ?? '(بلا اسم)';
       if (indexName === '_id_') continue;
-      if ('_fts' in (index.key as Record<string, unknown>)) continue;
+      const key = index.key as unknown as Record<string, unknown>;
+      if ('_fts' in key) continue;
 
-      const normalized = indexName.split('_').sort().join('_');
-      if (expectedNormalized.has(normalized)) continue;
+      const spec = expected.get(keySignature(key));
+      if (!spec) {
+        unknownIndexes.push({ model: modelName, collection: target.collection.collectionName, index: indexName });
+        if (DRY_RUN) continue;
 
-      unknownIndexes.push({ model: modelName, collection: target.collection.collectionName, index: indexName });
+        try {
+          await runAsSystem(async () => {
+            await target.collection.dropIndex(indexName);
+          });
+          dropped += 1;
+          logger.warn({ model: modelName, index: indexName }, 'حُذف فهرس غير معرّف في المخطط');
+        } catch (error) {
+          logger.error({ model: modelName, index: indexName, err: error }, 'تعذر حذف الفهرس');
+        }
+        continue;
+      }
+
+      const actualOptions = meaningfulOptions(index as unknown as Record<string, unknown>);
+      if (stableJson(actualOptions) === stableJson(spec.options)) continue;
+
+      optionMismatches.push({
+        model: modelName,
+        collection: target.collection.collectionName,
+        index: indexName,
+        expected: spec.options,
+      });
       if (DRY_RUN) continue;
 
       try {
         await runAsSystem(async () => {
           await target.collection.dropIndex(indexName);
+          try {
+            await target.collection.createIndex(spec.key, createOptionsFrom(spec.options, indexName));
+          } catch (error) {
+            // فشل بناء الفهرس المتوقع (مثلًا تكرارات تمنع unique) → أعِد القديم بدل تركه غائبًا
+            await target.collection
+              .createIndex(key as Record<string, number>, createOptionsFrom(actualOptions, indexName))
+              .catch(() => undefined);
+            throw error;
+          }
         });
-        dropped += 1;
-        logger.warn({ model: modelName, index: indexName }, 'حُذف فهرس غير معرّف في المخطط');
+        rebuilt += 1;
+        logger.warn(
+          { model: modelName, index: indexName, actual: actualOptions, expected: spec.options },
+          'أُعيد بناء فهرس بخيارات مختلفة عن المخطط',
+        );
       } catch (error) {
-        logger.error({ model: modelName, index: indexName, err: error }, 'تعذر حذف الفهرس');
+        logger.error({ model: modelName, index: indexName, err: error }, 'تعذر إعادة بناء الفهرس');
       }
     }
   }
 
   logger.info(
-    { unknownCount: unknownIndexes.length, dropped, unknown: unknownIndexes.slice(0, 40) },
+    {
+      unknownCount: unknownIndexes.length,
+      optionMismatchCount: optionMismatches.length,
+      dropped,
+      rebuilt,
+      unknown: unknownIndexes.slice(0, 40),
+      optionMismatches: optionMismatches.slice(0, 40),
+    },
     DRY_RUN ? 'تقرير الفهارس (معاينة — لم يُحذف شيء)' : 'انتهى فحص الفهارس',
   );
 

@@ -5,6 +5,9 @@ import { logger } from './config/logger.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { registerAllModels } from './models/register.js';
 import { startSlaScheduler } from './services/slaScheduler.js';
+import { startSubscriptionScheduler } from './services/subscriptionScheduler.js';
+import { startBackupScheduler } from './services/backupScheduler.js';
+import { recoverIncompletePosSales } from './services/posService.js';
 
 async function main(): Promise<void> {
   // تسجيل الموديلات كلها قبل الاتصال لضمان بناء الفهارس
@@ -12,9 +15,18 @@ async function main(): Promise<void> {
 
   await connectDatabase();
 
+  // استرداد أي بيع POS انهار في منتصفه قبل استقبال الطلبات
+  try {
+    await recoverIncompletePosSales();
+  } catch (err) {
+    logger.error({ err }, 'فشل استرداد مسودات بيع POS المعلّقة');
+  }
+
   const app = createApp();
   const server = http.createServer(app);
   const stopSlaScheduler = startSlaScheduler();
+  const stopSubscriptionScheduler = startSubscriptionScheduler();
+  const stopBackupScheduler = startBackupScheduler();
 
   server.listen(env.PORT, () => {
     logger.info(
@@ -31,6 +43,8 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     logger.info({ signal }, 'إيقاف السيرفر...');
     stopSlaScheduler();
+    stopSubscriptionScheduler();
+    stopBackupScheduler();
     server.close(() => void 0);
     await disconnectDatabase();
     process.exit(0);

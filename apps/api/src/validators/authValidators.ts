@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { egyptPhoneSchema, trimmedString } from './common.js';
+import { CENTER_ASSIGNABLE_PERMISSIONS, CENTER_ASSIGNABLE_ROLES } from '../constants/roles.js';
 
 export const loginSchema = z.object({
   identifier: z.string().trim().min(3, 'أدخل اسم المستخدم أو البريد'),
@@ -10,6 +11,30 @@ export const loginSchema = z.object({
 
 export const refreshSchema = z.object({
   refreshToken: z.string().min(10, 'رمز التجديد مطلوب'),
+});
+
+const totpCodeSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{6}$/, 'رمز التحقق 6 أرقام');
+
+export const verifyTwoFactorSchema = z.object({
+  challengeToken: z.string().trim().min(20, 'توكن التحقق مطلوب'),
+  code: z.string().trim().min(6, 'أدخل رمز التحقق أو رمز الاسترداد').max(20),
+});
+
+export const twoFactorCodeSchema = z.object({
+  code: totpCodeSchema,
+});
+
+export const disableTwoFactorSchema = z.object({
+  password: z.string().min(6, 'كلمة المرور مطلوبة'),
+  code: z.string().trim().min(6, 'أدخل رمز التحقق أو رمز الاسترداد').max(20),
+});
+
+export const regenerateRecoveryCodesSchema = z.object({
+  password: z.string().min(6, 'كلمة المرور مطلوبة'),
+  code: totpCodeSchema,
 });
 
 export const registerOrganizationSchema = z.object({
@@ -44,6 +69,23 @@ export const registerOrganizationSchema = z.object({
       code: z.string().trim().min(2).max(10).optional().default('MAIN'),
     })
     .optional(),
+});
+
+/**
+ * استعادة كلمة المرور.
+ * forgot-password يقبل البريد فقط ويرد دائمًا ردًا عامًا (لا يكشف وجود الحساب من عدمه).
+ */
+export const forgotPasswordSchema = z.object({
+  email: z.string().trim().toLowerCase().email('أدخل بريدًا إلكترونيًا صحيحًا'),
+});
+
+export const resetPasswordSchema = z.object({
+  token: z.string().trim().min(20, 'رمز الاستعادة غير صحيح'),
+  password: z
+    .string()
+    .min(8, 'كلمة المرور 8 أحرف على الأقل')
+    .regex(/[A-Za-z]/, 'لازم تحتوي على حرف')
+    .regex(/\d/, 'لازم تحتوي على رقم'),
 });
 
 export const changePasswordSchema = z.object({
@@ -89,10 +131,14 @@ export const createUserSchema = z.object({
     .min(8, 'كلمة المرور 8 أحرف على الأقل')
     .regex(/[A-Za-z]/, 'لازم تحتوي على حرف')
     .regex(/\d/, 'لازم تحتوي على رقم'),
-  role: z.enum(['owner', 'admin', 'manager', 'receptionist', 'technician', 'accountant', 'viewer']),
+  /** دور المنصة (platform) غير قابل للإنشاء من مسارات المركز — يُدار من إدارة المنصة */
+  role: z.enum(CENTER_ASSIGNABLE_ROLES),
   branchIds: z.array(z.string().regex(/^[0-9a-fA-F]{24}$/)).optional(),
-  extraPermissions: z.array(z.string()).optional(),
-  deniedPermissions: z.array(z.string()).optional(),
+  /** صلاحيات المنصة غير قابلة للمنح الفردي لمستخدم مركز (منع تصعيد الصلاحيات) */
+  extraPermissions: z
+    .array(z.enum(CENTER_ASSIGNABLE_PERMISSIONS))
+    .optional(),
+  deniedPermissions: z.array(z.enum(CENTER_ASSIGNABLE_PERMISSIONS)).optional(),
   technicianProfile: z
     .object({
       isTechnician: z.boolean().optional(),
@@ -122,3 +168,9 @@ export type UpdateUserInput = z.infer<typeof updateUserSchema>;
 export type ChangePasswordInput = z.infer<typeof changePasswordSchema>;
 export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
 export type RefreshInput = z.infer<typeof refreshSchema>;
+export type ForgotPasswordInput = z.infer<typeof forgotPasswordSchema>;
+export type ResetPasswordInput = z.infer<typeof resetPasswordSchema>;
+export type VerifyTwoFactorInput = z.infer<typeof verifyTwoFactorSchema>;
+export type TwoFactorCodeInput = z.infer<typeof twoFactorCodeSchema>;
+export type DisableTwoFactorInput = z.infer<typeof disableTwoFactorSchema>;
+export type RegenerateRecoveryCodesInput = z.infer<typeof regenerateRecoveryCodesSchema>;

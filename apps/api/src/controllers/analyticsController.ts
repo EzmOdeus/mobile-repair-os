@@ -3,7 +3,6 @@ import { Types } from 'mongoose';
 import { RepairTicketModel } from '../models/RepairTicket.js';
 import { CustomerModel } from '../models/Customer.js';
 import { DeviceModel } from '../models/Device.js';
-import { PartModel } from '../models/Part.js';
 import { PaymentModel } from '../models/Payment.js';
 import { InvoiceModel } from '../models/Invoice.js';
 import { ExpenseModel } from '../models/Expense.js';
@@ -19,6 +18,7 @@ import { money } from '../utils/money.js';
 import { dayKey, periodRange } from '../utils/dates.js';
 import { ACTIVE_REPAIR_STATUSES, REPAIR_STATUS_LABELS_AR, type RepairStatus } from '../constants/repair.js';
 import { env } from '../config/env.js';
+import { branchFilter } from '../middleware/auth.js';
 import { requestScope } from '../utils/requestScope.js';
 
 function resolveRange(req: Request): { from: Date; to: Date } {
@@ -41,6 +41,8 @@ export const dashboard = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const now = new Date();
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
 
   const [
     openTickets,
@@ -62,47 +64,48 @@ export const dashboard = async (req: Request, res: Response) => {
     activeTechnicians,
     pendingInvoices,
   ] = await Promise.all([
-    RepairTicketModel.countDocuments({ organizationId, status: { $in: ACTIVE_REPAIR_STATUSES } }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: { $in: ACTIVE_REPAIR_STATUSES } }),
     RepairTicketModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       status: { $in: ACTIVE_REPAIR_STATUSES },
       'sla.dueAt': { $lt: now },
     }),
-    RepairTicketModel.countDocuments({ organizationId, status: { $in: ['ready', 'customer_notified', 'paid'] } }),
-    RepairTicketModel.countDocuments({ organizationId, status: 'waiting_approval' }),
-    RepairTicketModel.countDocuments({ organizationId, status: 'waiting_part' }),
-    RepairTicketModel.countDocuments({ organizationId, status: 'repairing' }),
-    RepairTicketModel.countDocuments({ organizationId, status: 'delivered', deliveredAt: { $gte: from, $lte: to } }),
-    RepairTicketModel.countDocuments({ organizationId, createdAt: { $gte: from, $lte: to } }),
-    CustomerModel.countDocuments({ organizationId, isActive: true }),
-    DeviceModel.countDocuments({ organizationId, isActive: true }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: { $in: ['ready', 'customer_notified', 'paid'] } }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: 'waiting_approval' }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: 'waiting_part' }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: 'repairing' }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, status: 'delivered', deliveredAt: { $gte: from, $lte: to } }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } }),
+    CustomerModel.countDocuments({ organizationId, ...branchMatch, isActive: true }),
+    DeviceModel.countDocuments({ organizationId, ...branchMatch, isActive: true }),
     PaymentModel.aggregate<{ total: number }>([
-      { $match: { organizationId, direction: 'in', paidAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, direction: 'in', paidAt: { $gte: from, $lte: to } } },
       { $group: { _id: null, total: { $sum: '$amountEgp' } } },
     ]),
     InvoiceModel.aggregate<{ due: number }>([
-      { $match: { organizationId, 'totals.dueEgp': { $gt: 0.009 }, status: { $nin: ['void', 'draft'] } } },
+      { $match: { organizationId, ...branchMatch, 'totals.dueEgp': { $gt: 0.009 }, status: { $nin: ['void', 'draft'] } } },
       { $group: { _id: null, due: { $sum: '$totals.dueEgp' } } },
     ]),
-    PartModel.countDocuments({
-      organizationId,
+    InventoryItemModel.countDocuments({
+      organizationId, ...branchMatch,
       isActive: true,
-      $expr: { $lte: [{ $subtract: ['$stock.onHand', '$stock.reserved'] }, '$stock.reorderLevel'] },
+      $expr: { $lte: [{ $subtract: ['$quantity.onHand', '$quantity.reserved'] }, '$reorderLevel'] },
     }),
     QualityCheckModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       attempt: 1,
       result: { $in: ['passed', 'passed_with_notes'] },
       createdAt: { $gte: from, $lte: to },
     }),
-    QualityCheckModel.countDocuments({ organizationId, createdAt: { $gte: from, $lte: to } }),
-    WarrantyClaimModel.countDocuments({ organizationId, reportedAt: { $gte: from, $lte: to } }),
+    QualityCheckModel.countDocuments({ organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } }),
+    WarrantyClaimModel.countDocuments({ organizationId, ...branchMatch, reportedAt: { $gte: from, $lte: to } }),
     UserModel.countDocuments({
       organizationId,
+      ...(scopedBranch ? { branchIds: new Types.ObjectId(scopedBranch) } : {}),
       isActive: true,
       $or: [{ role: 'technician' }, { 'technicianProfile.isTechnician': true }],
     }),
-    InvoiceModel.countDocuments({ organizationId, status: { $in: ['issued', 'partially_paid'] } }),
+    InvoiceModel.countDocuments({ organizationId, ...branchMatch, status: { $in: ['issued', 'partially_paid'] } }),
   ]);
 
   return ok(res, {
@@ -141,15 +144,17 @@ export const dashboard = async (req: Request, res: Response) => {
 export const trends = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
   const days = Math.min(180, Math.max(1, Math.ceil((to.getTime() - from.getTime()) / 86_400_000)));
 
   const [createdTickets, deliveredTickets, payments, expenses] = await Promise.all([
     RepairTicketModel.aggregate<{ _id: string; count: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'Africa/Cairo' } }, count: { $sum: 1 } } },
     ]),
     RepairTicketModel.aggregate<{ _id: string; count: number; revenue: number }>([
-      { $match: { organizationId, status: 'delivered', deliveredAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, status: 'delivered', deliveredAt: { $gte: from, $lte: to } } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$deliveredAt', timezone: 'Africa/Cairo' } },
@@ -159,11 +164,11 @@ export const trends = async (req: Request, res: Response) => {
       },
     ]),
     PaymentModel.aggregate<{ _id: string; total: number }>([
-      { $match: { organizationId, direction: 'in', paidAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, direction: 'in', paidAt: { $gte: from, $lte: to } } },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$paidAt', timezone: 'Africa/Cairo' } }, total: { $sum: '$amountEgp' } } },
     ]),
     ExpenseModel.aggregate<{ _id: string; total: number }>([
-      { $match: { organizationId, incurredAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, incurredAt: { $gte: from, $lte: to } } },
       { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$incurredAt', timezone: 'Africa/Cairo' } }, total: { $sum: '$amountEgp' } } },
     ]),
   ]);
@@ -191,7 +196,7 @@ export const trends = async (req: Request, res: Response) => {
 
   // منحنى شهري للإيراد والتذاكر
   const monthly = await RepairTicketModel.aggregate<{ _id: string; tickets: number; revenue: number }>([
-    { $match: { organizationId, createdAt: { $gte: new Date(Date.now() - 365 * 86_400_000) } } },
+    { $match: { organizationId, ...branchMatch, createdAt: { $gte: new Date(Date.now() - 365 * 86_400_000) } } },
     {
       $group: {
         _id: { $dateToString: { format: '%Y-%m', date: '$createdAt', timezone: 'Africa/Cairo' } },
@@ -213,8 +218,10 @@ export const trends = async (req: Request, res: Response) => {
 export const statusDistribution = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
   const distribution = await RepairTicketModel.aggregate<{ _id: string; count: number; revenue: number }>([
-    { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+    { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
     { $group: { _id: '$status', count: { $sum: 1 }, revenue: { $sum: '$cost.totalFinalEgp' } } },
     { $sort: { count: -1 } },
   ]);
@@ -234,9 +241,11 @@ export const statusDistribution = async (req: Request, res: Response) => {
 export const faultAnalysis = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
   const [byCategory, byModel, bySeverity] = await Promise.all([
     RepairTicketModel.aggregate<{ _id: string; count: number; avgCost: number; warrantyReturns: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
       {
         $group: {
           _id: '$diagnosis.faultCategory',
@@ -249,13 +258,13 @@ export const faultAnalysis = async (req: Request, res: Response) => {
       { $limit: 25 },
     ]),
     RepairTicketModel.aggregate<{ _id: Types.ObjectId; count: number; avgCost: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
       { $group: { _id: '$deviceId', count: { $sum: 1 }, avgCost: { $avg: '$cost.totalFinalEgp' } } },
       { $sort: { count: -1 } },
       { $limit: 20 },
     ]),
     RepairTicketModel.aggregate<{ _id: string; count: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
       { $group: { _id: '$diagnosis.faultSeverity', count: { $sum: 1 } } },
     ]),
   ]);
@@ -286,16 +295,19 @@ export const faultAnalysis = async (req: Request, res: Response) => {
 export const turnaroundTimes = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
 
   const [stageDurations, totalTurnaround, slaStats] = await Promise.all([
     RepairStatusHistoryModel.aggregate<{ _id: string; avgMinutes: number; samples: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to }, durationMinutes: { $gt: 0 } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to }, durationMinutes: { $gt: 0 } } },
       { $group: { _id: '$fromStatus', avgMinutes: { $avg: '$durationMinutes' }, samples: { $sum: 1 } } },
       { $sort: { avgMinutes: -1 } },
     ]),
     RepairTicketModel.aggregate<{ avgHours: number; count: number }>([
       {
         $match: {
+          organizationId, ...branchMatch,
           status: 'delivered',
           deliveredAt: { $gte: from, $lte: to },
         },
@@ -308,7 +320,7 @@ export const turnaroundTimes = async (req: Request, res: Response) => {
       { $group: { _id: null, avgHours: { $avg: '$hours' }, count: { $sum: 1 } } },
     ]),
     RepairTicketModel.aggregate<{ _id: boolean; count: number }>([
-      { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+      { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
       { $group: { _id: '$sla.breached', count: { $sum: 1 } } },
     ]),
   ]);
@@ -346,6 +358,8 @@ export const turnaroundTimes = async (req: Request, res: Response) => {
 export const pilotKpis = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
 
   const [
     ticketsInRange,
@@ -359,14 +373,14 @@ export const pilotKpis = async (req: Request, res: Response) => {
     qcFirstTimePass,
     openTicketAge,
   ] = await Promise.all([
-    RepairTicketModel.countDocuments({ organizationId, createdAt: { $gte: from, $lte: to } }),
+    RepairTicketModel.countDocuments({ organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } }),
     RepairTicketModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       createdAt: { $gte: from, $lte: to },
       'evidence.intakePhotoCount': { $gt: 0 },
     }),
     RepairTicketModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       createdAt: { $gte: from, $lte: to },
       'evidence.hasSignature': true,
     }),
@@ -374,35 +388,35 @@ export const pilotKpis = async (req: Request, res: Response) => {
     // السبب: claim قد يُفتح على إصلاح قديم، واستخدام تسليمات الفترة وحدها يُنتج نسبًا
     // مضللة (قد تتجاوز 100%). نافذة 12 شهرًا هي أساس مستقر ومتعارف عليه لهذا المؤشر.
     RepairTicketModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       status: 'delivered',
       deliveredAt: { $gte: new Date(Date.now() - 365 * 86_400_000) },
     }),
-    ApprovalModel.countDocuments({ organizationId, decidedAt: { $gte: from, $lte: to } }),
+    ApprovalModel.countDocuments({ organizationId, ...branchMatch, decidedAt: { $gte: from, $lte: to } }),
     ApprovalModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       decidedAt: { $gte: from, $lte: to },
       decision: { $in: ['approved', 'partially_approved'] },
     }),
-    WarrantyClaimModel.countDocuments({ organizationId, reportedAt: { $gte: from, $lte: to } }),
-    QualityCheckModel.countDocuments({ organizationId, createdAt: { $gte: from, $lte: to } }),
+    WarrantyClaimModel.countDocuments({ organizationId, ...branchMatch, reportedAt: { $gte: from, $lte: to } }),
+    QualityCheckModel.countDocuments({ organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } }),
     QualityCheckModel.countDocuments({
-      organizationId,
+      organizationId, ...branchMatch,
       attempt: 1,
       result: { $in: ['passed', 'passed_with_notes'] },
       createdAt: { $gte: from, $lte: to },
     }),
     // متوسط عمر التذاكر المفتوحة *الآن* (مؤشر لحظي وليس مرتبطًا بالفترة)
     RepairTicketModel.aggregate<{ avgHours: number; count: number }>([
-      { $match: { organizationId, status: { $in: ACTIVE_REPAIR_STATUSES } } },
+      { $match: { organizationId, ...branchMatch, status: { $in: ACTIVE_REPAIR_STATUSES } } },
       { $project: { hours: { $divide: [{ $subtract: [new Date(), '$createdAt'] }, 3_600_000] } } },
       { $group: { _id: null, avgHours: { $avg: '$hours' }, count: { $sum: 1 } } },
     ]),
   ]);
 
   // دقة المخزون: نسبة القطع التي رصيدها مطابق لآخر جرد
-  const counted = await InventoryItemModel.countDocuments({ lastCountedAt: { $ne: null } });
-  const totalItems = await InventoryItemModel.countDocuments({ isActive: true });
+  const counted = await InventoryItemModel.countDocuments({ organizationId, ...branchMatch, lastCountedAt: { $ne: null } });
+  const totalItems = await InventoryItemModel.countDocuments({ organizationId, ...branchMatch, isActive: true });
 
   return ok(res, {
     period: { from, to },
@@ -484,8 +498,10 @@ export const pilotKpis = async (req: Request, res: Response) => {
 export const sourceAnalysis = async (req: Request, res: Response) => {
   const { from, to } = resolveRange(req);
   const { organizationId } = requestScope();
+  const scopedBranch = branchFilter(req);
+  const branchMatch = scopedBranch ? { branchId: new Types.ObjectId(scopedBranch) } : {};
   const result = await RepairTicketModel.aggregate<{ _id: string; count: number; revenue: number; avgCost: number }>([
-    { $match: { organizationId, createdAt: { $gte: from, $lte: to } } },
+    { $match: { organizationId, ...branchMatch, createdAt: { $gte: from, $lte: to } } },
     {
       $group: {
         _id: '$source',

@@ -3,7 +3,14 @@
   "services": {
     "api": {
       "root": "apps/api",
-      "framework": "express"
+      "framework": "express",
+      "buildCommand": "npm run build",
+      "functions": {
+        "server.js": {
+          "includeFiles": "{assets,docs}/**",
+          "maxDuration": 60
+        }
+      }
     },
     "web": {
       "root": "apps/web",
@@ -18,10 +25,44 @@
       }
     },
     {
+      "source": "/uploads/(.*)",
+      "destination": {
+        "service": "api"
+      }
+    },
+    {
+      "source": "/health",
+      "destination": {
+        "service": "api"
+      }
+    },
+    {
+      "source": "/docs",
+      "destination": {
+        "service": "api"
+      }
+    },
+    {
+      "source": "/docs/(.*)",
+      "destination": {
+        "service": "api"
+      }
+    },
+    {
       "source": "/(.*)",
       "destination": {
         "service": "web"
       }
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/v1/internal/cron/subscription",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/v1/internal/cron/sla",
+      "schedule": "0 3 * * *"
     }
   ]
 }

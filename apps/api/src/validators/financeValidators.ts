@@ -122,6 +122,20 @@ export const createExpenseSchema = z.object({
 
 export const updateExpenseSchema = createExpenseSchema.partial();
 
+/* ------------------------- الخزينة والورديات ------------------------- */
+
+export const openShiftSchema = z.object({
+  /** للأدوار المركزية فقط — الأدوار المقيّدة بفرعها تتجاهله */
+  branchId: objectIdSchema.optional(),
+  openingCashEgp: moneySchema.optional().default(0),
+  notes: z.string().trim().max(500).optional().default(''),
+});
+
+export const closeShiftSchema = z.object({
+  countedCashEgp: moneySchema,
+  notes: z.string().trim().max(1000).optional().default(''),
+});
+
 /* ----------------------------- الإشعارات ----------------------------- */
 
 export const sendMessageSchema = z.object({

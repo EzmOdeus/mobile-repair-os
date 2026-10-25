@@ -28,6 +28,7 @@ const storedFileSchema = new Schema(
         'evidence_video',
         'avatar',
         'org_logo',
+        'market_photo',
         'attachment',
       ],
       default: 'attachment',

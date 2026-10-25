@@ -1,6 +1,6 @@
 'use client';
 
-import { getAccessToken, getApiUrl, getRefreshToken, setTokens, clearSession } from './auth';
+import { getAccessToken, getActiveBranchId, getApiUrl, getRefreshToken, setTokens, clearSession } from './auth';
 
 export interface ApiErrorShape {
   code: string;
@@ -37,6 +37,12 @@ export interface Paginated<T> {
   meta: ListMeta;
 }
 
+export interface ApiRequestOptions extends RequestInit {
+  skipAuthRedirect?: boolean;
+  /** تثبيت الفرع المرسل في الطلب (يُستخدم عند مزامنة طابور قديم بعد تبديل الفرع) */
+  branchId?: string | null;
+}
+
 let refreshInFlight: Promise<boolean> | null = null;
 
 /** تجديد التوكن مرة واحدة عند انتهاء الصلاحية */
@@ -69,7 +75,7 @@ async function tryRefresh(): Promise<boolean> {
 
 async function request<T>(
   path: string,
-  options: RequestInit & { skipAuthRedirect?: boolean } = {},
+  options: ApiRequestOptions = {},
   isRetry = false,
 ): Promise<T> {
   const token = getAccessToken();
@@ -78,6 +84,8 @@ async function request<T>(
     headers.set('Content-Type', 'application/json');
   }
   if (token) headers.set('Authorization', `Bearer ${token}`);
+  const activeBranchId = options.branchId === undefined ? getActiveBranchId() : options.branchId;
+  if (activeBranchId) headers.set('x-branch-id', activeBranchId);
 
   const response = await fetch(`${getApiUrl()}${path}`, { ...options, headers });
 
@@ -119,15 +127,65 @@ async function request<T>(
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>(path, { method: 'GET' }),
-  post: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
-  patch: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: 'PATCH', body: body === undefined ? undefined : JSON.stringify(body) }),
-  put: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: 'PUT', body: body === undefined ? undefined : JSON.stringify(body) }),
-  del: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
-  upload: <T>(path: string, formData: FormData) => request<T>(path, { method: 'POST', body: formData }),
+  get: <T>(path: string, options?: ApiRequestOptions) => request<T>(path, { ...options, method: 'GET' }),
+  post: <T>(path: string, body?: unknown, options?: ApiRequestOptions) =>
+    request<T>(path, {
+      ...options,
+      method: 'POST',
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  patch: <T>(path: string, body?: unknown, options?: ApiRequestOptions) =>
+    request<T>(path, {
+      ...options,
+      method: 'PATCH',
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  put: <T>(path: string, body?: unknown, options?: ApiRequestOptions) =>
+    request<T>(path, {
+      ...options,
+      method: 'PUT',
+      body: body === undefined ? undefined : JSON.stringify(body),
+    }),
+  del: <T>(path: string, options?: ApiRequestOptions) => request<T>(path, { ...options, method: 'DELETE' }),
+  upload: <T>(path: string, formData: FormData, options?: ApiRequestOptions) =>
+    request<T>(path, { ...options, method: 'POST', body: formData }),
+  /** تنزيل ملف من الـAPI (مع تجديد الجلسة) وحفظه على جهاز المستخدم */
+  download: async (path: string, filename: string): Promise<void> => {
+    const fetchFile = () => {
+      const token = getAccessToken();
+      const branchId = getActiveBranchId();
+      return fetch(`${getApiUrl()}${path}`, {
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(branchId ? { 'x-branch-id': branchId } : {}),
+        },
+      });
+    };
+    let response = await fetchFile();
+    if (response.status === 401) {
+      const refreshed = await tryRefresh();
+      if (refreshed) response = await fetchFile();
+    }
+    if (!response.ok) {
+      let message = `خطأ من الخادم (${response.status})`;
+      try {
+        const payload = (await response.json()) as { error?: ApiErrorShape };
+        if (payload.error?.message) message = payload.error.message;
+      } catch {
+        // الرد ليس JSON — نُبقي الرسالة الافتراضية
+      }
+      throw new ApiClientError(response.status, { code: 'INTERNAL_ERROR', message });
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  },
 };
 
 /** دالة الجلب لـ SWR: تُرجع البيانات مباشرة وتُطلق خطأ ApiClientError */
@@ -154,4 +212,9 @@ export function errorMessage(err: unknown): string {
   if (err instanceof ApiClientError) return err.message;
   if (err instanceof Error) return err.message;
   return 'حدث خطأ غير متوقع';
+}
+
+/** فشل شبكة (لا رد من الخادم) وليس رفضًا من الـAPI */
+export function isNetworkError(err: unknown): boolean {
+  return err instanceof TypeError || (typeof navigator !== 'undefined' && navigator.onLine === false);
 }

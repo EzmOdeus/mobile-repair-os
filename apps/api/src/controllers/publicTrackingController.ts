@@ -329,6 +329,15 @@ export const decideByTrackingToken = async (req: Request, res: Response) => {
       });
 
       ticket.cost.totalFinalEgp = approvedTotal || ticket.cost.totalFinalEgp;
+      ticket.cost.partsQuotedEgp = money(
+        estimate.lines.filter((l) => l.kind === 'part').reduce((acc, l) => acc + (l.totalEgp ?? 0), 0),
+      );
+      ticket.cost.laborQuotedEgp = money(
+        estimate.lines.filter((l) => l.kind !== 'part').reduce((acc, l) => acc + (l.totalEgp ?? 0), 0),
+      );
+      ticket.cost.totalQuotedEgp = estimate.totals.totalEgp;
+      ticket.cost.discountEgp = estimate.totals.discountEgp;
+      ticket.cost.dueEgp = money(Math.max(0, (ticket.cost.totalFinalEgp ?? 0) - (ticket.cost.paidEgp ?? 0)));
       ticket.customerVisibleNotes =
         body.decision === 'rejected'
           ? `رفض العميل عرض السعر: ${body.rejectionReason ?? ''}`.trim()

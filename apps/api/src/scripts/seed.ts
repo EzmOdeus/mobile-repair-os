@@ -31,12 +31,21 @@ import { ExpenseModel } from '../models/Expense.js';
 import { NotificationModel } from '../models/Notification.js';
 import { AuditLogModel } from '../models/AuditLog.js';
 import { KnowledgeArticleModel } from '../models/KnowledgeArticle.js';
+import { PhonePriceGuideModel } from '../models/PhonePriceGuide.js';
 
 import { syncNumberCounters } from '../services/numberingService.js';
+import { normalizeMarketKey } from '../services/marketService.js';
 import { ACTIVE_REPAIR_STATUSES, type RepairStatus, type TicketPriority } from '../constants/repair.js';
+import { PLANS } from '../constants/plans.js';
 import { money } from '../utils/money.js';
 import { addDays, addHours } from '../utils/dates.js';
 import { formatSequenceNumber, publicToken, slugifyWithSuffix } from '../utils/ids.js';
+
+const VAT_RATE = 14;
+/** الضريبة مستخرجة من السعر الشامل، كما في إعدادات المركز الافتراضية */
+function inclusiveTax(totalEgp: number): number {
+  return money(totalEgp - totalEgp / (1 + VAT_RATE / 100));
+}
 
 /* ------------------------------------------------------------------ */
 /* أدوات مساعدة                                                        */
@@ -239,18 +248,142 @@ async function resetCounters(): Promise<void> {
   });
 }
 
+/* ---------------------- مدير المنصة ---------------------- */
+
+/** مؤسسة مرجعية داخلية يحملها حساب مدير المنصة (لا تُعد عميلة) */
+const PLATFORM_HQ_SLUG = 'platform-hq';
+const PLATFORM_ADMIN_USERNAME = 'platform.admin';
+const PLATFORM_ADMIN_PASSWORD = 'Platform@1234';
+
+/**
+ * يضمن وجود حساب مدير المنصة (role=platform) لإدارة المراكز من لوحة المنصة.
+ *
+ * ملاحظة تصميمية: organizationId إلزامي في كل مستخدم (عزل المستأجر مبني عليه)،
+ * لذلك يُربط الحساب بمؤسسة مرجعية داخلية بلا فروع ولا تذاكر، ومسارات /platform
+ * تعبر حدود المستأجر عمدًا لدور platform (محماي بصلاحيات platform:* فقط).
+ * idempotent: يُستدعى في كل تشغيل للبذرة حتى على قاعدة بيانات قائمة.
+ */
+async function ensurePlatformAdmin(): Promise<void> {
+  await runAsSystem(async () => {
+    let hq = await OrganizationModel.findOne({ slug: PLATFORM_HQ_SLUG });
+    if (!hq) {
+      hq = await OrganizationModel.create({
+        name: 'إدارة المنصة (داخلي)',
+        nameEn: 'Platform HQ',
+        slug: PLATFORM_HQ_SLUG,
+        isActive: true,
+        subscription: { plan: 'enterprise', status: 'active' },
+      });
+      logger.info({ slug: PLATFORM_HQ_SLUG }, 'تم إنشاء المؤسسة المرجعية الداخلية للمنصة');
+    }
+
+    const existingAdmin = await UserModel.findOne({ username: PLATFORM_ADMIN_USERNAME, organizationId: hq._id });
+    if (existingAdmin) {
+      if (existingAdmin.role !== 'platform') {
+        existingAdmin.role = 'platform';
+        await existingAdmin.save();
+        logger.warn({ username: PLATFORM_ADMIN_USERNAME }, 'تمت إعادة دور platform لحساب مدير المنصة');
+      }
+      return;
+    }
+
+    const admin = new UserModel({
+      organizationId: hq._id,
+      fullName: 'مدير المنصة',
+      username: PLATFORM_ADMIN_USERNAME,
+      role: 'platform',
+      isActive: true,
+    });
+    await admin.setPassword(PLATFORM_ADMIN_PASSWORD);
+    await admin.save();
+    logger.info({ username: PLATFORM_ADMIN_USERNAME }, 'تم إنشاء حساب مدير المنصة');
+  });
+}
+
+/**
+ * دليل أسعار مرجعي أولي لبورصة التليفونات (تديره المنصة لا المركز).
+ * idempotent بـ`$setOnInsert`: لا يستبدل أي سعر عدّلته المنصة لاحقًا.
+ */
+async function ensureMarketPriceGuides(): Promise<void> {
+  const sourceNote = 'متوسط أسعار السوق المصري — تحديث أكتوبر 2026';
+  const effectiveFrom = new Date('2026-10-01T00:00:00.000Z');
+  const rows = [
+    { brand: 'Apple', model: 'iPhone 13', storage: '128GB', condition: 'used', lowEgp: 12_500, avgEgp: 14_200, highEgp: 16_000 },
+    { brand: 'Apple', model: 'iPhone 14', storage: '128GB', condition: 'used', lowEgp: 18_000, avgEgp: 20_500, highEgp: 23_000 },
+    { brand: 'Apple', model: 'iPhone 15', storage: '128GB', condition: 'used', lowEgp: 24_000, avgEgp: 26_500, highEgp: 29_000 },
+    { brand: 'Samsung', model: 'Galaxy S24 Ultra', storage: '256GB', condition: 'used', lowEgp: 38_000, avgEgp: 42_000, highEgp: 46_000 },
+    { brand: 'Samsung', model: 'Galaxy S22 Ultra', storage: '256GB', condition: 'used', lowEgp: 18_000, avgEgp: 21_000, highEgp: 24_000 },
+    { brand: 'Samsung', model: 'Galaxy A15', storage: '128GB', condition: 'new', lowEgp: 6_000, avgEgp: 6_800, highEgp: 7_500 },
+    { brand: 'Xiaomi', model: 'Redmi Note 13', storage: '128GB', condition: 'new', lowEgp: 7_000, avgEgp: 7_800, highEgp: 8_500 },
+    { brand: 'Oppo', model: 'A78', storage: '128GB', condition: 'new', lowEgp: 5_800, avgEgp: 6_500, highEgp: 7_200 },
+    { brand: 'Realme', model: 'C67', storage: '128GB', condition: 'new', lowEgp: 6_000, avgEgp: 6_600, highEgp: 7_200 },
+    { brand: 'Infinix', model: 'Hot 40i', storage: '128GB', condition: 'new', lowEgp: 4_500, avgEgp: 5_200, highEgp: 5_800 },
+    { brand: 'Tecno', model: 'Spark 20', storage: '128GB', condition: 'new', lowEgp: 5_000, avgEgp: 5_600, highEgp: 6_200 },
+  ] as const;
+
+  await runAsSystem(async () => {
+    const result = await PhonePriceGuideModel.bulkWrite(
+      rows.map((row) => ({
+        updateOne: {
+          filter: {
+            brandKey: normalizeMarketKey(row.brand),
+            modelKey: normalizeMarketKey(row.model),
+            storageKey: normalizeMarketKey(row.storage),
+            condition: row.condition,
+            grade: 'none',
+          },
+          update: {
+            $setOnInsert: {
+              brand: row.brand,
+              model: row.model,
+              storage: row.storage,
+              brandKey: normalizeMarketKey(row.brand),
+              modelKey: normalizeMarketKey(row.model),
+              storageKey: normalizeMarketKey(row.storage),
+              condition: row.condition,
+              grade: 'none',
+              lowEgp: row.lowEgp,
+              avgEgp: row.avgEgp,
+              highEgp: row.highEgp,
+              currency: 'EGP',
+              effectiveFrom,
+              sourceNote,
+              isActive: true,
+              createdBy: null,
+              updatedBy: null,
+            },
+          },
+          upsert: true,
+        },
+      })),
+      { ordered: false },
+    );
+    logger.info(
+      { upserted: result.upsertedCount, matched: result.matchedCount },
+      'دليل أسعار بورصة التليفونات جاهز',
+    );
+  });
+}
+
 async function seed(): Promise<void> {
+  const shouldReset = process.argv.includes('--reset');
+  if (shouldReset && process.env.NODE_ENV === 'production' && !process.argv.includes('--force')) {
+    logger.error('رفض seed --reset على الإنتاج: العملية تمسح كل المؤسسات. استخدم --force فقط بعد نسخة احتياطية.');
+    process.exit(1);
+  }
+
   registerAllModels();
   await connectDatabase();
 
-  const shouldReset = process.argv.includes('--reset');
   const existing = await runAsSystem(() => OrganizationModel.findOne({ slug: SEED_ORG_SLUG }).lean());
 
   if (existing && !shouldReset) {
     logger.warn(
       { slug: SEED_ORG_SLUG },
-      'البيانات التجريبية موجودة بالفعل. شغّل "pnpm seed:reset" لإعادة البناء من الصفر.',
+      'البيانات التجريبية موجودة بالفعل. شغّل "npm run seed:reset" لإعادة البناء من الصفر.',
     );
+    await ensurePlatformAdmin();
+    await ensureMarketPriceGuides();
     await disconnectDatabase();
     return;
   }
@@ -258,6 +391,10 @@ async function seed(): Promise<void> {
     await wipe();
     await resetCounters();
   }
+
+  // مدير المنصة ودليل الأسعار يُنشآن دائمًا (حتى على قاعدة بيانات قائمة بلا reset)
+  await ensurePlatformAdmin();
+  await ensureMarketPriceGuides();
 
   /* ---------------------- المؤسسة والفروع ---------------------- */
   const organization = await OrganizationModel.create({
@@ -295,10 +432,10 @@ async function seed(): Promise<void> {
       status: 'active',
       startedAt: daysAgo(240),
       expiresAt: addDays(new Date(), 120),
-      maxUsers: 12,
-      maxBranches: 3,
-      monthlyTicketLimit: 1500,
-      priceEgp: 349,
+      maxUsers: PLANS.pro.maxUsers,
+      maxBranches: PLANS.pro.maxBranches,
+      monthlyTicketLimit: PLANS.pro.monthlyTicketLimit,
+      priceEgp: PLANS.pro.monthlyPriceEgp,
     },
     isActive: true,
     onboardedAt: daysAgo(240),
@@ -786,7 +923,7 @@ async function seed(): Promise<void> {
             partsQuotedEgp: reachedEstimate ? partsQuoted : 0,
             partsActualEgp: isDelivered ? partsQuoted : ['repairing', 'testing_qc', 'ready', 'paid'].includes(finalStatus) ? partsQuoted : 0,
             discountEgp: discount,
-            taxEgp: 0,
+            taxEgp: isPaid ? inclusiveTax(approvedTotal) : 0,
             totalQuotedEgp: reachedEstimate ? totalQuoted : 0,
             totalFinalEgp: isDelivered || finalStatus === 'paid' ? approvedTotal : reachedEstimate ? approvedTotal : 0,
             paidEgp: isPaid ? approvedTotal : 0,
@@ -944,8 +1081,8 @@ async function seed(): Promise<void> {
             subtotalEgp: money(labor + partsQuoted),
             discountEgp: ticket.cost.discountEgp ?? 0,
             discountPct: 0,
-            taxRatePct: 14,
-            taxEgp: 0,
+            taxRatePct: VAT_RATE,
+            taxEgp: inclusiveTax(money(labor + partsQuoted)),
             totalEgp: money(labor + partsQuoted),
             approvedTotalEgp: approvedTotal,
           },
@@ -1115,8 +1252,8 @@ async function seed(): Promise<void> {
           totals: {
             subtotalEgp: money(entry.labor + entry.partsQuoted),
             discountEgp: entry.ticket.cost.discountEgp ?? 0,
-            taxRatePct: 14,
-            taxEgp: 0,
+            taxRatePct: VAT_RATE,
+            taxEgp: inclusiveTax(entry.approvedTotal),
             totalEgp: entry.approvedTotal,
             paidEgp: entry.approvedTotal,
             dueEgp: 0,
@@ -1168,7 +1305,7 @@ async function seed(): Promise<void> {
           deviceId: entry.device._id,
           ticketId: entry.ticket._id,
           lines: [{ kind: 'service', description: 'خدمة صيانة آجلة', quantity: 1, unitPriceEgp: 850, totalEgp: 850, warrantyDays: 0 }],
-          totals: { subtotalEgp: 850, discountEgp: 0, taxRatePct: 14, taxEgp: 0, totalEgp: 850, paidEgp: 0, dueEgp: 850, changeEgp: 0 },
+          totals: { subtotalEgp: 850, discountEgp: 0, taxRatePct: VAT_RATE, taxEgp: inclusiveTax(850), totalEgp: 850, paidEgp: 0, dueEgp: 850, changeEgp: 0 },
           issuedAt,
           dueAt: addDays(issuedAt, 7),
           createdBy: receptionist._id,
@@ -1554,7 +1691,6 @@ async function seed(): Promise<void> {
    */
   const counterSeq = await syncNumberCounters();
   logger.info({ counterSeq }, 'عدّادات الترقيم بعد المزامنة (لكل مؤسسة)');
-
   // نُعيد أيضًا العدّادات القديمة (معلومات تشغيلية معروضة فقط، لا تُستخدم في الترقيم)
   await runAsSystem(async () => {
     for (const branch of branches) {
@@ -1577,6 +1713,7 @@ async function seed(): Promise<void> {
         receptionist: 'reception / Reception@1234',
         accountant: 'accountant / Account@1234',
         technician: 'tech.ahmed / Tech@1234',
+        platformAdmin: 'platform.admin / Platform@1234',
       },
     },
     'بيانات الدخول التجريبية',

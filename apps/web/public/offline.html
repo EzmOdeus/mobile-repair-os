@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f766e" />
+    <title>لا يوجد اتصال — Mobile Repair OS</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: #f8fafc;
+        color: #1e293b;
+        font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+        direction: rtl;
+        text-align: right;
+      }
+      main {
+        width: min(100%, 30rem);
+        border: 1px solid #e2e8f0;
+        border-radius: 20px;
+        background: #fff;
+        padding: 32px 28px;
+        box-shadow: 0 10px 30px rgb(15 23 42 / 8%);
+      }
+      .icon {
+        width: 64px;
+        height: 64px;
+        border-radius: 18px;
+        display: block;
+        margin-bottom: 20px;
+      }
+      h1 { font-size: 1.4rem; margin: 0 0 10px; color: #0f172a; }
+      p { line-height: 1.9; margin: 0 0 18px; color: #475569; font-size: 0.95rem; }
+      .hint {
+        border-radius: 12px;
+        background: #f0fdfa;
+        border: 1px solid #99f6e4;
+        color: #115e59;
+        padding: 12px 14px;
+        font-size: 0.85rem;
+        line-height: 1.8;
+        margin-bottom: 20px;
+      }
+      button {
+        width: 100%;
+        border: 0;
+        border-radius: 10px;
+        background: #0f766e;
+        color: #fff;
+        padding: 12px 16px;
+        font-size: 0.95rem;
+        font-weight: 700;
+        cursor: pointer;
+        font-family: inherit;
+      }
+      button:active { background: #115e59; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img class="icon" src="/icons/icon-192.png" alt="" width="64" height="64" />
+      <h1>لا يوجد اتصال بالإنترنت</h1>
+      <p>
+        هذه الصفحة تحتاج اتصالًا لعرض بيانات المركز. تحقق من الشبكة أو الواي فاي ثم أعد المحاولة.
+      </p>
+      <div class="hint">
+        تذكرة جديدة أُنشئت قبل انقطاع الاتصال تُحفظ على هذا الجهاز، وتُرسل تلقائيًا بمجرد عودة الشبكة.
+      </div>
+      <button type="button" onclick="location.reload()">إعادة المحاولة</button>
+    </main>
+    <script>
+      window.addEventListener('online', function () {
+        location.reload();
+      });
+    </script>
+  </body>
+</html>

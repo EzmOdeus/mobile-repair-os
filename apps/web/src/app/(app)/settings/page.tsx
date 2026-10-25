@@ -2,12 +2,13 @@
 
 import { useState } from 'react';
 import useSWR, { mutate } from 'swr';
-import { Building2, Plus, Save, Settings as SettingsIcon, ShieldCheck, Users } from 'lucide-react';
+import { Building2, CreditCard, DatabaseBackup, Download, Plus, Save, Settings as SettingsIcon, ShieldCheck, Users } from 'lucide-react';
 import { api, errorMessage, fetcher } from '@/lib/api';
 import { formatDateTime, formatMoney } from '@/lib/format';
 import { Badge, Card, CardHeader, EmptyState, Field, LoadingBlock, PageHeader } from '@/components/ui';
-import { Modal } from '@/components/ui/Modal';
+import { ConfirmDialog, Modal } from '@/components/ui/Modal';
 import { useToast } from '@/components/ui/Toast';
+import { TwoFactorCard } from '@/components/TwoFactorCard';
 import { useAuth, ROLE_LABELS_AR, type Role } from '@/lib/auth';
 
 interface OrganizationResponse {
@@ -47,10 +48,91 @@ interface OrganizationResponse {
     phone?: string;
     isDefault?: boolean;
     isActive?: boolean;
+    address?: { governorate?: string; city?: string; area?: string; street?: string };
     managerId?: { fullName?: string } | null;
   }[];
   usage: { activeUsers: number; activeBranches: number; limits?: { maxUsers?: number; maxBranches?: number } };
+  /** حالة الاشتراك المحسوبة من الخادم */
+  subscription?: {
+    planKey: string;
+    plan: {
+      key: string;
+      nameAr: string;
+      monthlyPriceEgp: number;
+      maxUsers: number;
+      maxBranches: number;
+      monthlyTicketLimit: number;
+      selfService?: boolean;
+      trialOnly?: boolean;
+      customPricing?: boolean;
+    };
+    status: 'trialing' | 'active' | 'past_due' | 'cancelled';
+    startedAt?: string | null;
+    expiresAt?: string | null;
+    graceEndsAt?: string | null;
+    daysRemaining?: number | null;
+    graceDaysRemaining?: number | null;
+    priceEgp?: number;
+    blocked: boolean;
+    inGrace: boolean;
+  };
 }
+
+interface PlanCatalogItem {
+  key: string;
+  nameAr: string;
+  maxUsers: number;
+  maxBranches: number;
+  monthlyTicketLimit: number;
+  monthlyPriceEgp: number;
+  selfService: boolean;
+  trialOnly: boolean;
+  customPricing: boolean;
+}
+
+interface SubscriptionPaymentRow {
+  id: string;
+  plan: string;
+  amountEgp: number;
+  months: number;
+  method: string;
+  methodLabelAr: string;
+  reference: string;
+  note: string;
+  periodStart: string;
+  periodEnd: string;
+  paidAt: string;
+  source: 'self_service' | 'platform';
+}
+
+interface RenewalRequestRow {
+  id: string;
+  plan: string;
+  months: number;
+  paymentMethod: string;
+  paymentMethodLabelAr: string;
+  paymentReference: string;
+  note: string;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled';
+  reviewNote: string;
+  reviewedAt?: string | null;
+  createdAt: string;
+}
+
+const PAYMENT_METHOD_OPTIONS = [
+  ['cash', 'نقدًا'],
+  ['bank_transfer', 'تحويل بنكي'],
+  ['wallet', 'محفظة إلكترونية'],
+  ['cheque', 'شيك'],
+  ['other', 'أخرى'],
+] as const;
+
+const RENEWAL_STATUS: Record<string, { label: string; className: string }> = {
+  pending: { label: 'قيد المراجعة', className: 'border-amber-200 bg-amber-50 text-amber-700' },
+  approved: { label: 'معتمد', className: 'border-emerald-200 bg-emerald-50 text-emerald-700' },
+  rejected: { label: 'مرفوض', className: 'border-red-200 bg-red-50 text-red-700' },
+  cancelled: { label: 'ملغي', className: 'border-ink-200 bg-ink-50 text-ink-500' },
+};
 
 interface UserRow {
   id: string;
@@ -60,16 +142,20 @@ interface UserRow {
   phone: string;
   role: Role;
   isActive: boolean;
+  branchIds?: string[];
   lastLoginAt?: string | null;
+  twoFactorEnabled?: boolean;
   permissions: string[];
 }
 
 const PLAN_LABELS: Record<string, string> = {
-  free: 'مجاني',
-  starter: 'Starter',
-  pro: 'Pro',
-  business: 'Business',
-  enterprise: 'Enterprise',
+  free: 'مجاني (قديم)',
+  trial: 'تجريبية',
+  starter: 'المبتدئة',
+  growth: 'النمو',
+  pro: 'الاحترافية',
+  business: 'Business (قديم)',
+  enterprise: 'المؤسسية',
 };
 
 export default function SettingsPage() {
@@ -78,12 +164,144 @@ export default function SettingsPage() {
   const [tab, setTab] = useState<'org' | 'branches' | 'users'>('org');
   const [branchOpen, setBranchOpen] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
+  const [branchEdit, setBranchEdit] = useState<OrganizationResponse['branches'][number] | null>(null);
+  const [userEdit, setUserEdit] = useState<UserRow | null>(null);
+  const [deactivateTarget, setDeactivateTarget] = useState<UserRow | null>(null);
+  const [twoFactorResetTarget, setTwoFactorResetTarget] = useState<UserRow | null>(null);
+  const [isUserBusy, setIsUserBusy] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
   const { data, error, isLoading } = useSWR<OrganizationResponse>('/organizations', fetcher);
   const { data: users } = useSWR<UserRow[]>(tab === 'users' && hasPermission('user:read') ? '/auth/users' : null, fetcher);
+  const { data: planCatalog } = useSWR<PlanCatalogItem[]>(
+    hasPermission('org:update') ? '/organizations/subscription/plans' : null,
+    fetcher,
+  );
 
   const [form, setForm] = useState<Record<string, unknown> | null>(null);
+  const [selectedPlan, setSelectedPlan] = useState<string | null>(null);
+  const [isPlanBusy, setIsPlanBusy] = useState(false);
+  const [isBackupBusy, setIsBackupBusy] = useState(false);
+  const [activation, setActivation] = useState({
+    months: 1,
+    paymentMethod: 'bank_transfer',
+    reference: '',
+    note: '',
+  });
+  const [renewalOpen, setRenewalOpen] = useState(false);
+  const [isRenewalBusy, setIsRenewalBusy] = useState(false);
+  const [renewalForm, setRenewalForm] = useState({
+    plan: 'enterprise',
+    months: 1,
+    paymentMethod: 'bank_transfer',
+    reference: '',
+    note: '',
+  });
+
+  const {
+    data: payments,
+    mutate: mutatePayments,
+  } = useSWR<SubscriptionPaymentRow[]>(
+    hasPermission('org:update') ? '/organizations/subscription/payments' : null,
+    fetcher,
+  );
+  const {
+    data: renewalRequests,
+    mutate: mutateRenewalRequests,
+  } = useSWR<RenewalRequestRow[]>(
+    hasPermission('org:update') ? '/organizations/subscription/renewal-requests' : null,
+    fetcher,
+  );
+
+  const downloadBackupAction = async () => {
+    setIsBackupBusy(true);
+    try {
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      await api.download('/organizations/backup/export', `backup-${data?.organization.slug ?? 'org'}-${stamp}.json`);
+      toast.success('تم تنزيل النسخة الاحتياطية');
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIsBackupBusy(false);
+    }
+  };
+
+  const changePlanAction = async () => {
+    const plan = chosenPlan;
+    if (!plan) return;
+    if (subState?.blocked) {
+      toast.error('الاشتراك موقوف — استخدم «تفعيل الآن» مع بيانات الدفع بدل تغيير الباقة.');
+      return;
+    }
+    setIsPlanBusy(true);
+    try {
+      await api.post('/organizations/subscription/change-plan', { plan });
+      toast.success('تم تغيير الباقة');
+      setSelectedPlan(null);
+      await mutate('/organizations');
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIsPlanBusy(false);
+    }
+  };
+
+  const activateAction = async () => {
+    const plan = chosenPlan;
+    if (!plan) return;
+    if (activation.reference.trim().length < 3) {
+      toast.error('أدخل مرجع الدفع (رقم التحويل أو الإيصال) — إلزامي لتسجيل الدفعة.');
+      return;
+    }
+    setIsPlanBusy(true);
+    try {
+      const response = await api.post<{ expiresAt?: string }>('/organizations/subscription/activate', {
+        plan,
+        months: activation.months,
+        paymentMethod: activation.paymentMethod,
+        paymentReference: activation.reference.trim(),
+        paymentNote: activation.note.trim(),
+      });
+      toast.success(
+        response.expiresAt
+          ? `تم تفعيل الاشتراك حتى ${formatDateTime(response.expiresAt)}`
+          : 'تم تفعيل الاشتراك',
+      );
+      setSelectedPlan(null);
+      setActivation((value) => ({ ...value, reference: '', note: '' }));
+      await Promise.all([mutate('/organizations'), mutatePayments(), mutateRenewalRequests()]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIsPlanBusy(false);
+    }
+  };
+
+  const submitRenewalRequest = async () => {
+    if (renewalForm.note.trim().length < 2 && !renewalForm.reference.trim()) {
+      toast.error('أضف ملاحظة أو مرجع تحويل حتى تراجع المنصة الطلب.');
+      return;
+    }
+    setIsRenewalBusy(true);
+    try {
+      await api.post('/organizations/subscription/renewal-requests', {
+        plan: renewalForm.plan,
+        months: renewalForm.months,
+        paymentMethod: renewalForm.paymentMethod,
+        paymentReference: renewalForm.reference.trim(),
+        note: renewalForm.note.trim(),
+      });
+      toast.success('تم إرسال طلب التجديد — ستتم مراجعته من إدارة المنصة.');
+      setRenewalOpen(false);
+      setRenewalForm((value) => ({ ...value, reference: '', note: '' }));
+      await mutateRenewalRequests();
+    } catch (err) {
+      toast.error(errorMessage(err));
+      void mutateRenewalRequests();
+    } finally {
+      setIsRenewalBusy(false);
+    }
+  };
 
   const current = form ?? data?.organization ?? null;
 
@@ -111,6 +329,62 @@ export default function SettingsPage() {
       toast.error(errorMessage(err));
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const toggleBranch = async (branch: OrganizationResponse['branches'][number]) => {
+    try {
+      if (branch.isActive === false) {
+        await api.patch(`/branches/${branch._id}`, { isActive: true });
+        toast.success('تم تفعيل الفرع');
+      } else {
+        await api.del(`/branches/${branch._id}`);
+        toast.success('تم تعطيل الفرع');
+      }
+      await mutate('/organizations');
+      await refreshProfile();
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  };
+
+  const deactivateUserAction = async () => {
+    if (!deactivateTarget) return;
+    setIsUserBusy(true);
+    try {
+      await api.del(`/auth/users/${deactivateTarget.id}`);
+      toast.success('تم تعطيل المستخدم');
+      setDeactivateTarget(null);
+      await Promise.all([mutate('/auth/users'), mutate('/organizations')]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIsUserBusy(false);
+    }
+  };
+
+  const activateUser = async (user: UserRow) => {
+    try {
+      await api.patch(`/auth/users/${user.id}`, { isActive: true });
+      toast.success('تم تفعيل المستخدم');
+      await Promise.all([mutate('/auth/users'), mutate('/organizations')]);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  };
+
+  const resetUserTwoFactorAction = async () => {
+    if (!twoFactorResetTarget) return;
+    setIsUserBusy(true);
+    try {
+      await api.post(`/auth/users/${twoFactorResetTarget.id}/2fa/reset`);
+      toast.success('تمت إعادة تعيين التحقق بخطوتين للمستخدم');
+      setTwoFactorResetTarget(null);
+      await mutate('/auth/users');
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      setIsUserBusy(false);
     }
   };
 
@@ -143,6 +417,30 @@ export default function SettingsPage() {
   const address = ((current as { address?: Record<string, string> }).address ?? {}) as Record<string, string>;
   const branding = ((current as { branding?: Record<string, string> }).branding ?? {}) as Record<string, string>;
   const subscription = data.organization.subscription;
+  const subState = data.subscription;
+  const selfServicePlans = planCatalog?.filter((plan) => plan.selfService) ?? [];
+  const currentPlanKey = subState?.planKey ?? subscription?.plan;
+  const chosenPlan =
+    selectedPlan ??
+    (selfServicePlans.some((plan) => plan.key === currentPlanKey)
+      ? currentPlanKey
+      : selfServicePlans[0]?.key ?? 'growth');
+  const chosenPlanInfo = planCatalog?.find((plan) => plan.key === chosenPlan);
+  const planName = (key?: string) =>
+    (key ? planCatalog?.find((plan) => plan.key === key)?.nameAr : undefined) ??
+    (key ? PLAN_LABELS[key] : undefined) ??
+    key ??
+    '—';
+  const currentPrice = subState?.priceEgp ?? subscription?.priceEgp ?? 0;
+  const pendingRenewal = renewalRequests?.find((request) => request.status === 'pending') ?? null;
+  const activationTotal = (chosenPlanInfo?.monthlyPriceEgp ?? 0) * activation.months;
+
+  const SUB_STATUS_LABELS: Record<string, string> = {
+    trialing: 'تجريبية',
+    active: 'نشطة',
+    past_due: 'مهلة سداد',
+    cancelled: 'موقوفة',
+  };
 
   return (
     <div>
@@ -161,29 +459,397 @@ export default function SettingsPage() {
       <div className="mb-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Card className="card-pad">
           <p className="text-xs font-semibold text-ink-500">الباقة الحالية</p>
-          <p className="mt-1 text-lg font-bold text-ink-900">{PLAN_LABELS[subscription?.plan ?? 'free'] ?? '—'}</p>
+          <p className="mt-1 text-lg font-bold text-ink-900">{subState?.plan.nameAr ?? planName(subscription?.plan)}</p>
           <p className="mt-0.5 text-xs text-ink-500">
-            {subscription?.status === 'active' ? 'نشطة' : subscription?.status === 'trialing' ? 'تجريبية' : subscription?.status ?? ''}
-            {subscription?.priceEgp ? ` · ${formatMoney(subscription.priceEgp)}/شهر` : ''}
+            {SUB_STATUS_LABELS[subState?.status ?? subscription?.status ?? ''] ?? subState?.status ?? subscription?.status ?? ''}
+            {subState?.plan.customPricing || (!subState && !subscription?.priceEgp)
+              ? ' · تسعير حسب الاتفاق'
+              : currentPrice
+                ? ` · ${formatMoney(currentPrice)}/شهر`
+                : ' · مجاني'}
           </p>
         </Card>
         <Card className="card-pad">
           <p className="text-xs font-semibold text-ink-500">المستخدمون</p>
           <p className="mt-1 text-lg font-bold text-ink-900 num">
-            {data.usage.activeUsers} / {subscription?.maxUsers ?? data.usage.limits?.maxUsers ?? '—'}
+            {data.usage.activeUsers} / {subState?.plan.maxUsers ?? subscription?.maxUsers ?? data.usage.limits?.maxUsers ?? '—'}
           </p>
         </Card>
         <Card className="card-pad">
           <p className="text-xs font-semibold text-ink-500">الفروع</p>
           <p className="mt-1 text-lg font-bold text-ink-900 num">
-            {data.usage.activeBranches} / {subscription?.maxBranches ?? data.usage.limits?.maxBranches ?? '—'}
+            {data.usage.activeBranches} / {subState?.plan.maxBranches ?? subscription?.maxBranches ?? data.usage.limits?.maxBranches ?? '—'}
           </p>
         </Card>
         <Card className="card-pad">
           <p className="text-xs font-semibold text-ink-500">حد التذاكر الشهري</p>
-          <p className="mt-1 text-lg font-bold text-ink-900 num">{subscription?.monthlyTicketLimit ?? '—'}</p>
+          <p className="mt-1 text-lg font-bold text-ink-900 num">
+            {subState?.plan.monthlyTicketLimit ?? subscription?.monthlyTicketLimit ?? '—'}
+          </p>
         </Card>
       </div>
+
+      <TwoFactorCard />
+
+      {hasPermission('org:update') && subState ? (
+        <Card className={`mb-4 ${subState.blocked ? 'border-red-300' : ''}`}>
+          <div className="card-pad">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="flex items-center gap-2 text-sm font-bold text-ink-800">
+                  <CreditCard size={16} /> الاشتراك والباقة
+                </h3>
+                <p className="mt-1 text-xs text-ink-500">
+                  الباقة: <span className="font-bold text-ink-700">{subState.plan.nameAr}</span>
+                  {' · '}الحالة: {SUB_STATUS_LABELS[subState.status] ?? subState.status}
+                  {subState.plan.customPricing ? ' · تسعير حسب الاتفاق' : ` · ${formatMoney(currentPrice)}/شهر`}
+                </p>
+                <p className="mt-0.5 text-xs text-ink-500">
+                  {subState.expiresAt ? `التغطية حتى ${formatDateTime(subState.expiresAt)}` : 'بدون تاريخ انتهاء'}
+                  {subState.daysRemaining !== null && subState.daysRemaining !== undefined
+                    ? subState.daysRemaining >= 0
+                      ? ` · متبقي ${subState.daysRemaining} يوم`
+                      : ` · انتهت منذ ${Math.abs(subState.daysRemaining)} يوم`
+                    : ''}
+                  {subState.inGrace && subState.graceDaysRemaining !== null && subState.graceDaysRemaining !== undefined
+                    ? ` · مهلة السداد: ${Math.max(subState.graceDaysRemaining, 0)} يوم متبقٍ`
+                    : ''}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => setRenewalOpen(true)}
+                disabled={Boolean(pendingRenewal)}
+              >
+                {pendingRenewal ? 'طلب تجديد قيد المراجعة' : 'طلب تجديد / عرض سعر'}
+              </button>
+            </div>
+
+            {subState.blocked ? (
+              <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-xs font-bold text-red-700">
+                {subState.status === 'cancelled'
+                  ? 'اشتراك مركزك موقوف — الإنشاء الجديد (مستخدمين/فروع/تذاكر) متوقف حتى تفعيل باقة. القراءة والتقارير متاحة.'
+                  : 'انتهت فترة الاشتراك — جدّد باقتك الآن لاستئناف العمل دون انقطاع.'}
+              </div>
+            ) : null}
+            {!subState.blocked && subState.inGrace ? (
+              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs font-bold text-amber-700">
+                انتهت فترة الاشتراك وأنت في مهلة سداد — سدّد وفعّل الباقة قبل الإيقاف الكامل.
+              </div>
+            ) : null}
+
+            <div className="mt-4">
+              <p className="text-xs font-bold text-ink-600">باقات التفعيل الذاتي — بعد الدفع خارج المنصة</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {selfServicePlans.map((plan) => (
+                  <label
+                    key={plan.key}
+                    className={`cursor-pointer rounded-lg border px-3 py-2 transition ${
+                      chosenPlan === plan.key ? 'border-brand-600 bg-brand-50' : 'border-ink-200 hover:border-ink-400'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="plan"
+                      className="sr-only"
+                      checked={chosenPlan === plan.key}
+                      onChange={() => setSelectedPlan(plan.key)}
+                    />
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-bold text-ink-800">{plan.nameAr}</p>
+                      <p className="text-xs font-bold text-brand-700">{formatMoney(plan.monthlyPriceEgp)}/شهر</p>
+                    </div>
+                    <p className="mt-0.5 text-[11px] text-ink-500">
+                      {plan.maxUsers} مستخدم · {plan.maxBranches} فرع · {plan.monthlyTicketLimit} تذكرة/شهر
+                    </p>
+                  </label>
+                ))}
+                <div className="rounded-lg border border-dashed border-ink-300 bg-ink-25 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-bold text-ink-800">المؤسسية</p>
+                    <p className="text-xs font-bold text-ink-600">حسب الاتفاق</p>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-ink-500">
+                    تُفعّلها إدارة المنصة بعد الاتفاق على السعر — استخدم «طلب تجديد / عرض سعر».
+                  </p>
+                </div>
+              </div>
+              <p className="mt-1.5 text-[11px] text-ink-400">
+                الفترة التجريبية 14 يومًا تنتهي تلقائيًا ولا تُباع كباقة. الترقية بين باقات النمو والاحترافية متاحة في أي وقت.
+              </p>
+            </div>
+
+            <div className="mt-4 rounded-lg border border-ink-200 bg-ink-25 p-3">
+              <p className="text-xs font-bold text-ink-700">بيانات الدفع للتفعيل / التجديد</p>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                <Field label="عدد الشهور" required>
+                  <select
+                    className="input"
+                    value={activation.months}
+                    onChange={(event) =>
+                      setActivation((value) => ({ ...value, months: Number(event.target.value) }))
+                    }
+                  >
+                    {[1, 3, 6, 12].map((months) => (
+                      <option key={months} value={months}>
+                        {months} شهر
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="طريقة الدفع" required>
+                  <select
+                    className="input"
+                    value={activation.paymentMethod}
+                    onChange={(event) =>
+                      setActivation((value) => ({ ...value, paymentMethod: event.target.value }))
+                    }
+                  >
+                    {PAYMENT_METHOD_OPTIONS.map(([value, label]) => (
+                      <option key={value} value={value}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="مرجع الدفع" required hint="رقم التحويل أو الإيصال">
+                  <input
+                    className="input"
+                    value={activation.reference}
+                    onChange={(event) =>
+                      setActivation((value) => ({ ...value, reference: event.target.value }))
+                    }
+                    placeholder="TRX-123456"
+                  />
+                </Field>
+                <Field label="ملاحظة (اختياري)">
+                  <input
+                    className="input"
+                    value={activation.note}
+                    onChange={(event) => setActivation((value) => ({ ...value, note: event.target.value }))}
+                    placeholder="اسم المُحوِّل مثلًا"
+                  />
+                </Field>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={activateAction}
+                  disabled={isPlanBusy || !chosenPlan || !chosenPlanInfo}
+                >
+                  {isPlanBusy ? 'جارٍ التنفيذ…' : subState.blocked ? 'تفعيل الاشتراك الآن' : 'تجديد الاشتراك'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={changePlanAction}
+                  disabled={isPlanBusy || subState.blocked || chosenPlan === currentPlanKey}
+                >
+                  تغيير الباقة بدون تمديد
+                </button>
+                {chosenPlanInfo ? (
+                  <span className="text-xs font-bold text-ink-700">
+                    المستحق: {formatMoney(activationTotal)} ({chosenPlanInfo.nameAr} × {activation.months} شهر)
+                  </span>
+                ) : null}
+              </div>
+              <p className="mt-1.5 text-[11px] text-ink-400">
+                التفعيل يسجّل دفعة إلزامية بالمبلغ المعروض، ويمدّد من نهاية التغطية السارية إن وُجدت. طلبات التجديد
+                بأسعار مخصصة (المؤسسية) تُراجع من إدارة المنصة.
+              </p>
+            </div>
+
+            <div className="mt-4 grid gap-4 lg:grid-cols-2">
+              <div>
+                <p className="mb-2 text-xs font-bold text-ink-600">آخر المدفوعات</p>
+                {payments?.length ? (
+                  <div className="overflow-x-auto rounded-lg border border-ink-100">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-ink-100 bg-ink-25 text-ink-500">
+                          <th className="px-3 py-2 text-right font-semibold">التاريخ</th>
+                          <th className="px-3 py-2 text-right font-semibold">الباقة</th>
+                          <th className="px-3 py-2 text-right font-semibold">المبلغ</th>
+                          <th className="px-3 py-2 text-right font-semibold">الطريقة</th>
+                          <th className="px-3 py-2 text-right font-semibold">المرجع</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {payments.slice(0, 8).map((payment) => (
+                          <tr key={payment.id} className="border-b border-ink-50 last:border-0">
+                            <td className="px-3 py-2 text-ink-500">{formatDateTime(payment.paidAt)}</td>
+                            <td className="px-3 py-2 font-semibold text-ink-700">{planName(payment.plan)}</td>
+                            <td className="px-3 py-2 font-bold text-ink-800 num">
+                              {formatMoney(payment.amountEgp)}
+                              <span className="text-[10px] font-normal text-ink-400"> / {payment.months} شهر</span>
+                            </td>
+                            <td className="px-3 py-2 text-ink-600">{payment.methodLabelAr}</td>
+                            <td className="px-3 py-2 text-ink-500" dir="ltr">
+                              {payment.reference || '—'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="rounded-lg border border-dashed border-ink-200 px-3 py-4 text-center text-xs text-ink-400">
+                    لا توجد مدفوعات مسجّلة بعد.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <p className="mb-2 text-xs font-bold text-ink-600">طلبات التجديد</p>
+                {renewalRequests?.length ? (
+                  <div className="space-y-1.5">
+                    {renewalRequests.slice(0, 5).map((request) => {
+                      const meta = RENEWAL_STATUS[request.status] ?? {
+                        label: request.status,
+                        className: 'border-ink-200 bg-ink-50 text-ink-600',
+                      };
+                      return (
+                        <div
+                          key={request.id}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-ink-100 px-3 py-2 text-xs"
+                        >
+                          <div>
+                            <p className="font-bold text-ink-700">
+                              {planName(request.plan)} · {request.months} شهر
+                              <span className="font-normal text-ink-400"> — {formatDateTime(request.createdAt)}</span>
+                            </p>
+                            {request.reviewNote ? (
+                              <p className="mt-0.5 text-ink-500">ملاحظة المراجعة: {request.reviewNote}</p>
+                            ) : request.note ? (
+                              <p className="mt-0.5 text-ink-500">{request.note}</p>
+                            ) : null}
+                          </div>
+                          <Badge className={meta.className}>{meta.label}</Badge>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="rounded-lg border border-dashed border-ink-200 px-3 py-4 text-center text-xs text-ink-400">
+                    لا توجد طلبات تجديد. استخدم الزر أعلى البطاقة لطلب عرض سعر أو تجديد بمساعدة المنصة.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </Card>
+      ) : null}
+
+      <Modal
+        open={renewalOpen}
+        onClose={() => setRenewalOpen(false)}
+        title="طلب تجديد / عرض سعر"
+        subtitle="يراجع الطلب فريق المنصة ثم يفعّل الاشتراك ويسجّل الدفعة"
+        size="lg"
+        footer={
+          <>
+            <button type="button" className="btn-secondary" onClick={() => setRenewalOpen(false)}>
+              إلغاء
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              onClick={() => void submitRenewalRequest()}
+              disabled={isRenewalBusy}
+            >
+              {isRenewalBusy ? 'جارٍ الإرسال…' : 'إرسال الطلب'}
+            </button>
+          </>
+        }
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="الباقة المطلوبة" required>
+            <select
+              className="input"
+              value={renewalForm.plan}
+              onChange={(event) => setRenewalForm((value) => ({ ...value, plan: event.target.value }))}
+            >
+              {(planCatalog ?? [])
+                .filter((plan) => !plan.trialOnly)
+                .map((plan) => (
+                  <option key={plan.key} value={plan.key}>
+                    {plan.nameAr}
+                    {plan.customPricing ? ' — حسب الاتفاق' : ` — ${formatMoney(plan.monthlyPriceEgp)}/شهر`}
+                  </option>
+                ))}
+            </select>
+          </Field>
+          <Field label="عدد الشهور" required>
+            <select
+              className="input"
+              value={renewalForm.months}
+              onChange={(event) =>
+                setRenewalForm((value) => ({ ...value, months: Number(event.target.value) }))
+              }
+            >
+              {[1, 3, 6, 12].map((months) => (
+                <option key={months} value={months}>
+                  {months} شهر
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="طريقة الدفع">
+            <select
+              className="input"
+              value={renewalForm.paymentMethod}
+              onChange={(event) =>
+                setRenewalForm((value) => ({ ...value, paymentMethod: event.target.value }))
+              }
+            >
+              {PAYMENT_METHOD_OPTIONS.map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="مرجع التحويل (اختياري)">
+            <input
+              className="input"
+              value={renewalForm.reference}
+              onChange={(event) =>
+                setRenewalForm((value) => ({ ...value, reference: event.target.value }))
+              }
+              placeholder="BANK-123456"
+            />
+          </Field>
+          <div className="sm:col-span-2">
+            <Field label="ملاحظة" hint="اذكر السعر المتفق عليه أو أي تفاصيل تساعد المنصة">
+              <textarea
+                className="input min-h-20"
+                value={renewalForm.note}
+                onChange={(event) => setRenewalForm((value) => ({ ...value, note: event.target.value }))}
+                placeholder="نرغب في تجديد الباقة المؤسسية لمدة سنة بسعر..."
+              />
+            </Field>
+          </div>
+        </div>
+      </Modal>
+
+      {hasPermission('org:update') ? (
+        <Card className="mb-4">
+          <div className="card-pad">
+            <h3 className="flex items-center gap-2 text-sm font-bold text-ink-800">
+              <DatabaseBackup size={16} /> النسخ الاحتياطي
+            </h3>
+            <p className="mt-1 text-xs text-ink-500">
+              نسخة JSON لكل بيانات المركز (تذاكر، عملاء، أجهزة، فواتير، مخزون، مستخدمون) بمعرّفاتها الأصلية —
+              قابلة للاستعادة على قاعدة جديدة. الصور والتواقيع ليست داخل الملف وتُنسخ من مجلد الملفات أو التخزين السحابي.
+            </p>
+            <button type="button" className="btn-secondary mt-3" onClick={downloadBackupAction} disabled={isBackupBusy}>
+              <Download size={16} /> {isBackupBusy ? 'جارٍ التحضير…' : 'تنزيل نسخة احتياطية (JSON)'}
+            </button>
+          </div>
+        </Card>
+      ) : null}
 
       <Card className="mb-4">
         <div className="flex flex-wrap items-center gap-2 border-b border-ink-100 px-3 py-2">
@@ -453,6 +1119,7 @@ export default function SettingsPage() {
                       <th>الهاتف</th>
                       <th>المدير</th>
                       <th>الحالة</th>
+                      <th />
                     </tr>
                   </thead>
                   <tbody>
@@ -482,6 +1149,24 @@ export default function SettingsPage() {
                             {branch.isActive === false ? 'موقوف' : 'نشط'}
                           </Badge>
                         </td>
+                        <td>
+                          {hasPermission('branch:manage') ? (
+                            <div className="flex flex-wrap gap-1">
+                              <button type="button" className="btn-ghost px-2 py-1 text-[11px]" onClick={() => setBranchEdit(branch)}>
+                                تعديل
+                              </button>
+                              {!branch.isDefault ? (
+                                <button
+                                  type="button"
+                                  className={`btn-ghost px-2 py-1 text-[11px] ${branch.isActive === false ? 'text-emerald-700' : 'text-red-600'}`}
+                                  onClick={() => void toggleBranch(branch)}
+                                >
+                                  {branch.isActive === false ? 'تفعيل' : 'تعطيل'}
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -508,13 +1193,21 @@ export default function SettingsPage() {
                       <th>الهاتف</th>
                       <th>آخر دخول</th>
                       <th>الحالة</th>
+                      <th />
                     </tr>
                   </thead>
                   <tbody>
                     {users?.length ? (
                       users.map((user) => (
                         <tr key={user.id}>
-                          <td className="text-xs font-medium">{user.fullName}</td>
+                          <td className="text-xs font-medium">
+                            <span className="inline-flex items-center gap-1.5">
+                              {user.fullName}
+                              {user.twoFactorEnabled ? (
+                                <ShieldCheck size={13} className="text-emerald-600" aria-label="التحقق بخطوتين مفعّل" />
+                              ) : null}
+                            </span>
+                          </td>
                           <td className="text-xs" dir="ltr">
                             {user.username}
                           </td>
@@ -538,11 +1231,46 @@ export default function SettingsPage() {
                               {user.isActive ? 'نشط' : 'موقوف'}
                             </Badge>
                           </td>
+                          <td>
+                            {hasPermission('user:manage') ? (
+                              <div className="flex flex-wrap gap-1">
+                                <button type="button" className="btn-ghost px-2 py-1 text-[11px]" onClick={() => setUserEdit(user)}>
+                                  تعديل
+                                </button>
+                                {user.twoFactorEnabled ? (
+                                  <button
+                                    type="button"
+                                    className="btn-ghost px-2 py-1 text-[11px] text-amber-700"
+                                    onClick={() => setTwoFactorResetTarget(user)}
+                                  >
+                                    إعادة تعيين 2FA
+                                  </button>
+                                ) : null}
+                                {user.isActive ? (
+                                  <button
+                                    type="button"
+                                    className="btn-ghost px-2 py-1 text-[11px] text-red-600"
+                                    onClick={() => setDeactivateTarget(user)}
+                                  >
+                                    تعطيل
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    className="btn-ghost px-2 py-1 text-[11px] text-emerald-700"
+                                    onClick={() => void activateUser(user)}
+                                  >
+                                    تفعيل
+                                  </button>
+                                )}
+                              </div>
+                            ) : null}
+                          </td>
                         </tr>
                       ))
                     ) : (
                       <tr>
-                        <td colSpan={6}>
+                        <td colSpan={7}>
                           <EmptyState title="لا يوجد مستخدمون" icon={<Users size={20} />} />
                         </td>
                       </tr>
@@ -593,7 +1321,266 @@ export default function SettingsPage() {
         }}
         onError={(message) => toast.error(message)}
       />
+
+      <EditBranchModal
+        key={branchEdit?._id ?? 'branch-none'}
+        branch={branchEdit}
+        onClose={() => setBranchEdit(null)}
+        onDone={async () => {
+          setBranchEdit(null);
+          await Promise.all([mutate('/organizations'), refreshProfile()]);
+          toast.success('تم تحديث الفرع');
+        }}
+        onError={(message) => toast.error(message)}
+      />
+
+      <EditUserModal
+        key={userEdit?.id ?? 'user-none'}
+        user={userEdit}
+        branches={data.branches.map((b) => ({ id: b._id, name: b.name }))}
+        onClose={() => setUserEdit(null)}
+        onDone={async () => {
+          setUserEdit(null);
+          await Promise.all([mutate('/auth/users'), mutate('/organizations')]);
+          toast.success('تم تحديث المستخدم');
+        }}
+        onError={(message) => toast.error(message)}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deactivateTarget)}
+        title={`تعطيل ${deactivateTarget?.fullName ?? ''}`}
+        message="لن يستطيع المستخدم تسجيل الدخول بعد التعطيل، وتبقى بياناته وسجلاته محفوظة. يمكنك تفعيله مرة أخرى في أي وقت."
+        confirmLabel="تعطيل المستخدم"
+        onCancel={() => setDeactivateTarget(null)}
+        onConfirm={() => void deactivateUserAction()}
+        isLoading={isUserBusy}
+      />
+
+      <ConfirmDialog
+        open={Boolean(twoFactorResetTarget)}
+        title={`إعادة تعيين التحقق بخطوتين لـ${twoFactorResetTarget?.fullName ?? ''}`}
+        message="سيُلغى سر المصادقة وكل رموز الاسترداد، وستُطلب إعادة الإعداد في الدخول القادم. استخدم هذا الخيار فقط إذا فقد المستخدم هاتفه ورموز الاسترداد."
+        confirmLabel="إعادة تعيين 2FA"
+        onCancel={() => setTwoFactorResetTarget(null)}
+        onConfirm={() => void resetUserTwoFactorAction()}
+        isLoading={isUserBusy}
+      />
     </div>
+  );
+}
+
+function EditBranchModal({
+  branch,
+  onClose,
+  onDone,
+  onError,
+}: {
+  branch: OrganizationResponse['branches'][number] | null;
+  onClose: () => void;
+  onDone: () => void | Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [form, setForm] = useState(() => ({
+    name: branch?.name ?? '',
+    code: branch?.code ?? '',
+    phone: branch?.phone ?? '',
+    governorate: branch?.address?.governorate ?? '',
+    city: branch?.address?.city ?? '',
+    area: branch?.address?.area ?? '',
+  }));
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const open = Boolean(branch);
+
+  const submit = async () => {
+    if (!branch) return;
+    if (!form.name.trim() || !form.code.trim()) return onError('اسم الفرع والكود مطلوبان');
+    setIsSubmitting(true);
+    try {
+      await api.patch(`/branches/${branch._id}`, {
+        name: form.name,
+        code: form.code,
+        phone: form.phone,
+        address: { governorate: form.governorate, city: form.city, area: form.area },
+      });
+      await onDone();
+    } catch (err) {
+      onError(errorMessage(err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={`تعديل ${branch?.name ?? ''}`}
+      footer={
+        <>
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            إلغاء
+          </button>
+          <button type="button" className="btn-primary" onClick={() => void submit()} disabled={isSubmitting}>
+            {isSubmitting ? 'جارٍ الحفظ…' : 'حفظ التعديلات'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="اسم الفرع" required>
+          <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        </Field>
+        <Field label="كود الفرع" required>
+          <input className="input" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} dir="ltr" />
+        </Field>
+        <Field label="الهاتف">
+          <input className="input" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} dir="ltr" />
+        </Field>
+        <Field label="المحافظة">
+          <input className="input" value={form.governorate} onChange={(e) => setForm({ ...form, governorate: e.target.value })} />
+        </Field>
+        <Field label="المدينة">
+          <input className="input" value={form.city} onChange={(e) => setForm({ ...form, city: e.target.value })} />
+        </Field>
+        <Field label="المنطقة">
+          <input className="input" value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} />
+        </Field>
+      </div>
+    </Modal>
+  );
+}
+
+function EditUserModal({
+  user,
+  branches,
+  onClose,
+  onDone,
+  onError,
+}: {
+  user: UserRow | null;
+  branches: { id: string; name: string }[];
+  onClose: () => void;
+  onDone: () => void | Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [form, setForm] = useState(() => ({
+    fullName: user?.fullName ?? '',
+    phone: user?.phone ?? '',
+    email: user?.email ?? '',
+    role: (user?.role ?? 'technician') as Role,
+    branchIds: user?.branchIds ?? ([] as string[]),
+    newPassword: '',
+  }));
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const submit = async () => {
+    if (!user) return;
+    if (form.fullName.trim().length < 2) return onError('اسم المستخدم قصير جدًا');
+    if (form.newPassword && form.newPassword.length < 8) return onError('كلمة المرور الجديدة 8 أحرف على الأقل');
+    setIsSubmitting(true);
+    try {
+      await api.patch(`/auth/users/${user.id}`, {
+        fullName: form.fullName,
+        phone: form.phone,
+        email: form.email,
+        role: form.role,
+        branchIds: form.branchIds,
+        ...(form.newPassword ? { newPassword: form.newPassword } : {}),
+      });
+      await onDone();
+    } catch (err) {
+      onError(errorMessage(err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={Boolean(user)}
+      onClose={onClose}
+      title={`تعديل ${user?.fullName ?? ''}`}
+      subtitle={`@${user?.username ?? ''}`}
+      size="lg"
+      footer={
+        <>
+          <button type="button" className="btn-secondary" onClick={onClose}>
+            إلغاء
+          </button>
+          <button type="button" className="btn-primary" onClick={() => void submit()} disabled={isSubmitting}>
+            {isSubmitting ? 'جارٍ الحفظ…' : 'حفظ التعديلات'}
+          </button>
+        </>
+      }
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="الاسم الكامل" required>
+          <input className="input" value={form.fullName} onChange={(e) => setForm({ ...form, fullName: e.target.value })} />
+        </Field>
+        <Field label="الدور" required>
+          <select
+            className="input"
+            value={form.role}
+            onChange={(e) => setForm({ ...form, role: e.target.value as Role })}
+          >
+            {Object.entries(ROLE_LABELS_AR)
+              .filter(([role]) => role !== 'platform')
+              .map(([role, label]) => (
+                <option key={role} value={role}>
+                  {label}
+                </option>
+              ))}
+          </select>
+        </Field>
+        <Field label="الهاتف">
+          <input className="input" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} dir="ltr" />
+        </Field>
+        <Field label="البريد الإلكتروني">
+          <input type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} dir="ltr" />
+        </Field>
+        <div className="sm:col-span-2">
+          <span className="label">الفروع المسموحة</span>
+          <div className="flex flex-wrap gap-2">
+            {branches.map((branch) => (
+              <label
+                key={branch.id}
+                className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs ${
+                  form.branchIds.includes(branch.id) ? 'border-brand-600 bg-brand-50 text-brand-800' : 'border-ink-300'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5"
+                  checked={form.branchIds.includes(branch.id)}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      branchIds: e.target.checked
+                        ? [...form.branchIds, branch.id]
+                        : form.branchIds.filter((id) => id !== branch.id),
+                    })
+                  }
+                />
+                {branch.name}
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="sm:col-span-2">
+          <Field label="كلمة مرور جديدة (اختياري)" hint="اتركها فارغة إن لم ترغب في تغيير كلمة المرور">
+            <input
+              type="password"
+              className="input"
+              value={form.newPassword}
+              onChange={(e) => setForm({ ...form, newPassword: e.target.value })}
+              dir="ltr"
+            />
+          </Field>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

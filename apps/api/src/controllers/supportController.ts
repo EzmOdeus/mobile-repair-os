@@ -38,6 +38,7 @@ export const listNotifications = async (req: Request, res: Response) => {
     NotificationModel.find(filter)
       .populate('customerId', 'fullName phone')
       .populate('ticketId', 'ticketNumber')
+      .populate('listingId', 'title status priceEgp')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)

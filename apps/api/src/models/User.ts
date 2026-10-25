@@ -12,6 +12,15 @@ export interface UserMethods {
   readonly isLocked: boolean;
 }
 
+/** دوال على مستوى الموديل (statics) — هذه النسخة من Mongoose لا تُمثّلها في عامِلات Model، فنوسّع الواجهة */
+export interface UserModelWithStatics extends Model<User, unknown, UserMethods> {
+  /**
+   * استهلاك رمز الاستعادة بشكل ذري (انظر التعليق أعلى التعريف).
+   * يُعيد مستند المستخدم عند النجاح، أو null إن كان الرمز غير صحيح/منتهي/مُستهلكًا.
+   */
+  consumePasswordResetToken(tokenHash: string, password: string): Promise<UserDoc | null>;
+}
+
 type UserModelType = Model<User, unknown, UserMethods>;
 
 const technicianProfileSchema = new Schema(
@@ -69,6 +78,18 @@ const userSchema = new Schema(
     lockedUntil: { type: Date, default: null },
     passwordChangedAt: { type: Date, default: null },
     mustChangePassword: { type: Boolean, default: false },
+    /** استعادة كلمة المرور: نخزّن SHA-256 للرمز لا الرمز نفسه */
+    passwordResetTokenHash: { type: String, select: false, default: null },
+    passwordResetExpiresAt: { type: Date, default: null },
+    /**
+     * المصادقة الثنائية: السر مشفّر AES-256-GCM، والسر المؤقت لا يُستخدم
+     * للتحقق حتى يؤكّد المستخدم رمزًا صحيحًا (يمنع تفعيل إعداد لم يُمسح).
+     */
+    twoFactorEnabled: { type: Boolean, default: false },
+    twoFactorSecret: { type: String, select: false, default: null },
+    twoFactorPendingSecret: { type: String, select: false, default: null },
+    twoFactorRecoveryCodeHashes: { type: [String], select: false, default: [] },
+    twoFactorEnabledAt: { type: Date, default: null },
     createdBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
   },
   { timestamps: true },
@@ -91,6 +112,15 @@ userSchema.index(
 );
 userSchema.index({ organizationId: 1, isActive: 1, role: 1 });
 userSchema.index({ fullName: 'text', username: 'text' });
+/**
+ * فهرس رمز الاستعادة (partial: للرموز الفعلية فقط) — بحث `reset-password` يعمل
+ * بلا سياق مستأجر على مستوى المنصة كلها، فبدون فهرس كان يمسح كل المستخدمين.
+ * التفرد هنا آمن ماديًا (رمز عشوائي مُجزّأ) ويشتغل كضمان إضافي.
+ */
+userSchema.index(
+  { passwordResetTokenHash: 1 },
+  { unique: true, partialFilterExpression: { passwordResetTokenHash: { $type: 'string' } } },
+);
 
 userSchema.methods.setPassword = async function setPassword(plain: string): Promise<void> {
   this.passwordHash = await bcrypt.hash(plain, BCRYPT_ROUNDS);
@@ -105,9 +135,41 @@ userSchema.virtual('isLocked').get(function isLocked(this: User): boolean {
   return Boolean(this.lockedUntil && this.lockedUntil.getTime() > Date.now());
 });
 
+/**
+ * استهلاك رمز الاستعادة في **تحديث واحد ذري**: شرط التحديث يحتوي الرمز وسلامة
+ * صلاحيته معًا، و`$unset` يزيل الرمز في نفس العملية — فلو تنافس طلبان بنفس
+ * الرمز نجح أحدهما فقط (`findOneAndUpdate` ذرية)، على عكس الأسلوب السابق
+ * (فحص بـfindOne ثم حفظ بـsave) الذي ترك نافذة استخدام مزدوج للرمز.
+ */
+userSchema.statics.consumePasswordResetToken = async function consumePasswordResetToken(
+  this: UserModelType,
+  tokenHash: string,
+  password: string,
+): Promise<UserDoc | null> {
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  const now = new Date();
+  return this.findOneAndUpdate(
+    {
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: { $ne: null, $gt: now },
+    },
+    {
+      $set: {
+        passwordHash,
+        passwordChangedAt: now,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        mustChangePassword: false,
+      },
+      $unset: { passwordResetTokenHash: '', passwordResetExpiresAt: '' },
+    },
+    { new: true, projection: 'fullName username role organizationId' },
+  ).exec();
+};
+
 export type User = InferSchemaType<typeof userSchema>;
 
 export type UserDoc = HydratedDocument<User, UserMethods>;
 
-export const UserModel = model<User, UserModelType>('User', userSchema);
+export const UserModel = model<User, UserModelType>('User', userSchema) as UserModelWithStatics;
 export default UserModel;

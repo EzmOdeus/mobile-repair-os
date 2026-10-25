@@ -105,6 +105,8 @@ const checklistItemInput = z.object({
 
 export const createTicketSchema = z
   .object({
+    /** يمنع تكرار التذكرة عند إعادة إرسالها من طابور عدم الاتصال */
+    clientRequestId: z.string().trim().min(8).max(120).optional(),
     customerId: objectIdSchema.optional(),
     deviceId: objectIdSchema.optional(),
     /** إنشاء عميل وجهاز معًا في نفس الطلب (شاشة الاستقبال السريعة) */

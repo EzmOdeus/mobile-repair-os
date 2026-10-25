@@ -22,3 +22,8 @@ tmp/
 .vscode/
 .idea/
 *.tsbuildinfo
+
+.vercel
+playwright-report/
+test-results/
+blob-report/

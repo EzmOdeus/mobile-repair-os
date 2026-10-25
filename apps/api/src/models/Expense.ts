@@ -45,6 +45,8 @@ const expenseSchema = new Schema(
     supplierId: { type: Schema.Types.ObjectId, ref: 'Supplier', default: null },
     /** ربط اختياري بمصروف شراء قطع */
     relatedInvoiceNumber: { type: String, default: '' },
+    /** الوردية المفتوحة للفرع وقت التسجيل — أساس حساب درج النقد */
+    shiftId: { type: Schema.Types.ObjectId, ref: 'Shift', default: null, index: true },
     attachmentFileId: { type: Schema.Types.ObjectId, ref: 'StoredFile', default: null },
     notes: { type: String, default: '' },
     isRecurring: { type: Boolean, default: false },
@@ -57,6 +59,7 @@ const expenseSchema = new Schema(
 expenseSchema.plugin(tenantPlugin);
 expenseSchema.index({ organizationId: 1, incurredAt: -1, category: 1 });
 expenseSchema.index({ organizationId: 1, branchId: 1, incurredAt: -1 });
+expenseSchema.index({ organizationId: 1, shiftId: 1, incurredAt: -1 });
 
 export type Expense = InferSchemaType<typeof expenseSchema>;
 export type ExpenseDoc = HydratedDocument<Expense>;

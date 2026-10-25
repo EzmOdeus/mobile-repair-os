@@ -13,7 +13,7 @@ import { OrganizationModel } from '../models/Organization.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok, paginated } from '../utils/asyncHandler.js';
 import { parseListQuery } from '../utils/queryHelpers.js';
-import { getAuth } from '../middleware/auth.js';
+import { branchFilter, getAuth, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { money } from '../utils/money.js';
@@ -31,6 +31,8 @@ export const listQualityChecks = async (req: Request, res: Response) => {
   if (query.ticketId) filter.ticketId = query.ticketId;
   if (query.result) filter.result = query.result;
   if (query.inspectorId) filter.inspectorId = query.inspectorId;
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
 
   const [items, total] = await Promise.all([
     QualityCheckModel.find(filter)
@@ -79,6 +81,7 @@ export const createQualityCheck = async (req: Request, res: Response) => {
   };
 
   const ticket = await getTicketOrFail(body.ticketId);
+  requireBranchAccess(req, ticket.branchId);
 
   const existingAttempts = await QualityCheckModel.countDocuments({ ticketId: ticket._id });
   const items =
@@ -148,6 +151,7 @@ export const submitQualityCheck = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const qc = await QualityCheckModel.findById(req.params.id);
   if (!qc) throw ApiError.notFound('سجل الفحص غير موجود');
+  requireBranchAccess(req, qc.branchId);
   if (qc.result !== 'pending') throw ApiError.businessRule('تم تسجيل نتيجة هذا الفحص بالفعل');
 
   const body = req.body as {
@@ -256,6 +260,8 @@ export const submitQualityCheck = async (req: Request, res: Response) => {
 export const qualityStats = async (req: Request, res: Response) => {
   const query = req.query as Record<string, unknown>;
   const match: Record<string, unknown> = {};
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) match.branchId = scopedBranch;
   if (query.from || query.to) {
     const range: Record<string, Date> = {};
     if (query.from) range.$gte = new Date(String(query.from));
@@ -321,6 +327,8 @@ export const listWarrantyClaims = async (req: Request, res: Response) => {
   if (query.technicianId) filter.originalTechnicianId = query.technicianId;
   if (query.deviceId) filter.deviceId = query.deviceId;
   if (query.sameFault !== undefined) filter.isSameFault = query.sameFault === 'true';
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) filter.branchId = scopedBranch;
 
   const [items, total] = await Promise.all([
     WarrantyClaimModel.find(filter)
@@ -348,6 +356,7 @@ export const getWarrantyClaim = async (req: Request, res: Response) => {
     .populate('originalTechnicianId', 'fullName')
     .lean();
   if (!claim) throw ApiError.notFound('claim الضمان غير موجود');
+  requireBranchAccess(req, claim.branchId);
   return ok(res, claim);
 };
 
@@ -373,6 +382,7 @@ export const createWarrantyClaim = async (req: Request, res: Response) => {
   };
 
   const originalTicket = await getTicketOrFail(body.originalTicketId);
+  requireBranchAccess(req, originalTicket.branchId);
 
   if (originalTicket.status !== 'delivered' && originalTicket.status !== 'warranty') {
     throw ApiError.businessRule('لا يمكن فتح claim ضمان على تذكرة لم تُسلَّم بعد');
@@ -396,10 +406,13 @@ export const createWarrantyClaim = async (req: Request, res: Response) => {
     .select('_id partId supplierId')
     .lean();
 
+  // المطالبة وتذكرة العودة تتبعان فرع التذكرة الأصلية، وليس الفرع النشط للمستخدم
+  const claimBranchId = originalTicket.branchId ?? ctx!.branchId;
+
   const claim = await withUniqueRetry(nextClaimNumber, (claimNumber) =>
     WarrantyClaimModel.create({
       organizationId: ctx!.organizationId,
-      branchId: ctx!.branchId,
+      branchId: claimBranchId,
       claimNumber,
       customerId: originalTicket.customerId,
       deviceId: originalTicket.deviceId,
@@ -426,7 +439,7 @@ export const createWarrantyClaim = async (req: Request, res: Response) => {
     const newTicket = await withUniqueRetry(nextTicketNumber, (ticketNumber) =>
       RepairTicketModel.create({
         organizationId: ctx!.organizationId,
-        branchId: ctx!.branchId,
+        branchId: claimBranchId,
         ticketNumber,
         trackingToken: nextTrackingToken(),
         customerId: originalTicket.customerId,
@@ -494,6 +507,7 @@ export const decideWarrantyClaim = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const claim = await WarrantyClaimModel.findById(req.params.id);
   if (!claim) throw ApiError.notFound('claim الضمان غير موجود');
+  requireBranchAccess(req, claim.branchId);
 
   const body = req.body as {
     status: string;
@@ -509,10 +523,14 @@ export const decideWarrantyClaim = async (req: Request, res: Response) => {
     resolutionNotes?: string;
   };
 
+  if (body.status === 'rejected' && !body.rejectedReason?.trim()) {
+    throw ApiError.badRequest('سبب رفض المطالبة مطلوب');
+  }
+
   claim.status = body.status as typeof claim.status;
   if (body.coverage) claim.coverage = body.coverage;
   claim.decisionNotes = body.decisionNotes ?? claim.decisionNotes;
-  claim.rejectedReason = body.rejectedReason ?? '';
+  claim.rejectedReason = body.status === 'rejected' ? body.rejectedReason!.trim() : '';
   claim.repairCostEgp = money(body.repairCostEgp);
   claim.chargedToCustomerEgp = money(body.chargedToCustomerEgp);
   claim.chargedToSupplierEgp = money(body.chargedToSupplierEgp);
@@ -571,12 +589,19 @@ export const decideWarrantyClaim = async (req: Request, res: Response) => {
 export const warrantyIntelligence = async (req: Request, res: Response) => {
   const query = req.query as Record<string, unknown>;
   const match: Record<string, unknown> = {};
-  if (query.from || query.to) {
-    const range: Record<string, Date> = {};
-    if (query.from) range.$gte = new Date(String(query.from));
-    if (query.to) range.$lte = new Date(String(query.to));
-    match.reportedAt = range;
-  }
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) match.branchId = scopedBranch;
+
+  const range: Record<string, Date> = {};
+  if (query.from) range.$gte = new Date(String(query.from));
+  if (query.to) range.$lte = new Date(String(query.to));
+  const hasRange = Object.keys(range).length > 0;
+  if (hasRange) match.reportedAt = range;
+
+  // مقام معدل العودة يجب أن يتبع نفس الفرع والفترة، وإلا ظهر المعدل منخفضًا في الفرع
+  const deliveredFilter: Record<string, unknown> = { status: 'delivered' };
+  if (scopedBranch) deliveredFilter.branchId = scopedBranch;
+  if (hasRange) deliveredFilter.deliveredAt = range;
 
   const [totalClaims, byFault, byTechnician, byModel, resolvedStats, totalDelivered] = await Promise.all([
     WarrantyClaimModel.countDocuments(match),
@@ -623,7 +648,7 @@ export const warrantyIntelligence = async (req: Request, res: Response) => {
         },
       },
     ]),
-    RepairTicketModel.countDocuments({ status: 'delivered' }),
+    RepairTicketModel.countDocuments(deliveredFilter),
   ]);
 
   const technicianIds = byTechnician.map((t) => t._id).filter(Boolean);
@@ -634,7 +659,10 @@ export const warrantyIntelligence = async (req: Request, res: Response) => {
   const devices = await DeviceModel.find({ _id: { $in: deviceIds } }).select('brand model').lean();
   const devMap = new Map(devices.map((d) => [String(d._id), `${d.brand} ${d.model}`]));
 
-  const totalCost = resolvedStats.reduce((acc, s) => acc + (s.cost ?? 0), 0);
+  // تكلفة الضمان الفعلية تُحسب على المطالبات المقبولة/قيد الإصلاح/المحلولة فقط
+  const totalCost = resolvedStats
+    .filter((s) => ['approved', 'in_repair', 'resolved'].includes(s._id))
+    .reduce((acc, s) => acc + (s.cost ?? 0), 0);
 
   return ok(res, {
     totalClaims,
@@ -671,6 +699,8 @@ export const warrantyIntelligence = async (req: Request, res: Response) => {
 export const failingPartsReport = async (req: Request, res: Response) => {
   const query = req.query as Record<string, unknown>;
   const match: Record<string, unknown> = { status: { $in: ['installed', 'defective'] } };
+  const scopedBranch = branchFilter(req);
+  if (scopedBranch) match.branchId = scopedBranch;
   if (query.from || query.to) {
     const range: Record<string, Date> = {};
     if (query.from) range.$gte = new Date(String(query.from));
@@ -724,7 +754,8 @@ export const failingPartsReport = async (req: Request, res: Response) => {
 };
 
 /** أداء الموردين من ناحية العيوب */
-export const supplierQualityReport = async (_req: Request, res: Response) => {
+export const supplierQualityReport = async (req: Request, res: Response) => {
+  const scopedBranch = branchFilter(req);
   const results = await SupplierModel.aggregate<{
     _id: Types.ObjectId;
     name: string;
@@ -738,6 +769,14 @@ export const supplierQualityReport = async (_req: Request, res: Response) => {
         localField: '_id',
         foreignField: 'supplierId',
         as: 'batches',
+      },
+    },
+    {
+      $project: {
+        name: 1,
+        batches: scopedBranch
+          ? { $filter: { input: '$batches', as: 'batch', cond: { $eq: ['$$batch.branchId', scopedBranch] } } }
+          : '$batches',
       },
     },
     {

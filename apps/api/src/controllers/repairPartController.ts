@@ -6,7 +6,7 @@ import { PartModel } from '../models/Part.js';
 import { RepairTicketModel } from '../models/RepairTicket.js';
 import { ApiError } from '../utils/ApiError.js';
 import { created, ok } from '../utils/asyncHandler.js';
-import { getAuth } from '../middleware/auth.js';
+import { getAuth, requireBranchAccess } from '../middleware/auth.js';
 import { getTenantContext } from '../context/tenantContext.js';
 import { recordAudit } from '../services/auditService.js';
 import { applyStockMovement, refreshPartQualityStats } from '../services/inventoryService.js';
@@ -21,6 +21,7 @@ export const addRepairPart = async (req: Request, res: Response) => {
   const ctx = getTenantContext();
   const organizationId = ctx!.organizationId;
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -117,6 +118,7 @@ export const updateRepairPart = async (req: Request, res: Response) => {
   if (!repairPart) throw ApiError.notFound('القطعة غير مسجلة على التذكرة');
 
   const ticket = await getTicketOrFail(repairPart.ticketId);
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -250,6 +252,7 @@ export const removeRepairPart = async (req: Request, res: Response) => {
   if (!repairPart) throw ApiError.notFound('القطعة غير مسجلة على التذكرة');
 
   const ticket = await getTicketOrFail(String(repairPart.ticketId));
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -302,6 +305,7 @@ export const addLabor = async (req: Request, res: Response) => {
   const auth = getAuth(req);
   const ctx = getTenantContext();
   const ticket = await getTicketOrFail(String(req.params.id));
+  requireBranchAccess(req, ticket.branchId);
   if (auth.role === 'technician') {
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
@@ -361,6 +365,7 @@ export const removeLabor = async (req: Request, res: Response) => {
 
   if (auth.role === 'technician') {
     const ticket = await getTicketOrFail(String(labor.ticketId));
+    requireBranchAccess(req, ticket.branchId);
     assertTechnicianOwnership(ticket, { userId: auth.userId, fullName: auth.fullName, role: auth.role }, false, true);
   }
 

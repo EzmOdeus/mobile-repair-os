@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from 'express';
 import { Types } from 'mongoose';
 import { AuditLogModel } from '../models/AuditLog.js';
-import { getTenantContext, type TenantContext } from '../context/tenantContext.js';
+import { getTenantContext, runAsSystem, type TenantContext } from '../context/tenantContext.js';
 import { logger } from '../config/logger.js';
 import type { AuditAction } from '../models/AuditLog.js';
 
@@ -45,26 +45,31 @@ export async function recordAudit(input: AuditInput, req?: Request): Promise<voi
       .slice(0, 50)
       .map((c) => ({ field: c.field, before: c.before ?? null, after: c.after ?? null }));
 
-    await AuditLogModel.create({
-      organizationId: ctx.organizationId,
-      branchId: ctx.branchId,
-      action: input.action,
-      resource: input.resource,
-      resourceId: input.resourceId ?? null,
-      summary: input.summary ?? '',
-      changes,
-      actorId: ctx.actor.userId,
-      actorName: ctx.actor.fullName,
-      actorRole: ctx.actor.role,
-      ip: ctx.ip ?? '',
-      userAgent: ctx.userAgent ?? '',
-      requestId: ctx.requestId,
-      method: req?.method ?? '',
-      path: req?.originalUrl ?? '',
-      statusCode: req?.res?.statusCode ?? 0,
-      severity: input.severity ?? 'info',
-      occurredAt: new Date(),
-    });
+    // نكتب السجل داخل علم النظام: عمليات إدارة المنصة تُسجّل في سجل مركز مستهدف
+    // مختلف عن مؤسسة الفاعل، وكان guardDocument يرفض هذا التعارض (TENANT_MISMATCH)
+    // رغم أن السياق الصريح أعلاه يحمل كل بيانات السجل الصحيحة (المؤسسة الهدف، الفاعل، IP).
+    await runAsSystem(() =>
+      AuditLogModel.create({
+        organizationId: ctx.organizationId,
+        branchId: ctx.branchId,
+        action: input.action,
+        resource: input.resource,
+        resourceId: input.resourceId ?? null,
+        summary: input.summary ?? '',
+        changes,
+        actorId: ctx.actor.userId,
+        actorName: ctx.actor.fullName,
+        actorRole: ctx.actor.role,
+        ip: ctx.ip ?? '',
+        userAgent: ctx.userAgent ?? '',
+        requestId: ctx.requestId,
+        method: req?.method ?? '',
+        path: req?.originalUrl ?? '',
+        statusCode: req?.res?.statusCode ?? 0,
+        severity: input.severity ?? 'info',
+        occurredAt: new Date(),
+      }),
+    );
   } catch (err) {
     logger.error({ err, action: input.action }, 'فشل كتابة سجل التدقيق');
   }
