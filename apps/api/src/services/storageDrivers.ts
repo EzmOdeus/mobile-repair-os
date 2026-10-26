@@ -3,6 +3,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { S3Client } from '@aws-sdk/client-s3';
+import { BlobNotFoundError, del as deleteBlob, get as getBlob, head as headBlob, put as putBlob } from '@vercel/blob';
 import { env } from '../config/env.js';
 import { ApiError } from '../utils/ApiError.js';
 import { logger } from '../config/logger.js';
@@ -138,8 +139,46 @@ const s3Driver: StorageDriver = {
   },
 };
 
+/* ------------------------------ Vercel Blob ------------------------------ */
+
+const blobDriver: StorageDriver = {
+  async put(storageKey, buffer, mimeType) {
+    await putBlob(storageKey, buffer, {
+      access: 'private',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: mimeType,
+    });
+  },
+  async getStream(storageKey) {
+    const result = await getBlob(storageKey, { access: 'private' });
+    if (!result || result.statusCode !== 200) throw ApiError.notFound('الملف غير موجود');
+    return Readable.fromWeb(result.stream);
+  },
+  async exists(storageKey) {
+    try {
+      await headBlob(storageKey);
+      return true;
+    } catch (err) {
+      if (!(err instanceof BlobNotFoundError)) {
+        logger.warn({ err, storageKey }, 'فشل فحص وجود الملف في Vercel Blob');
+      }
+      return false;
+    }
+  },
+  async delete(storageKey) {
+    try {
+      await deleteBlob(storageKey);
+    } catch (err) {
+      logger.warn({ err, storageKey }, 'تعذر حذف الملف من Vercel Blob');
+    }
+  },
+};
+
 /* ------------------------------ الاختيار ------------------------------ */
 
 export function getStorageDriver(): StorageDriver {
-  return env.STORAGE_DRIVER === 's3' ? s3Driver : localDriver;
+  if (env.STORAGE_DRIVER === 's3') return s3Driver;
+  if (env.STORAGE_DRIVER === 'blob') return blobDriver;
+  return localDriver;
 }

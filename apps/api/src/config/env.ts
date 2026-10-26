@@ -30,7 +30,9 @@ const envSchema = z.object({
   UPLOAD_URL_TTL_MINUTES: z.coerce.number().int().positive().default(120),
 
   /** محرك التخزين: قرص محلي أو S3 متوافق (AWS S3 / Cloudflare R2 / MinIO) */
-  STORAGE_DRIVER: z.enum(['local', 's3']).default('local'),
+  STORAGE_DRIVER: z.enum(['local', 's3', 'blob']).default('local'),
+  /** Vercel Blob read/write token; injected when a store is connected to the project. */
+  BLOB_READ_WRITE_TOKEN: z.string().optional().default(''),
   S3_ENDPOINT: z.string().optional().default(''),
   S3_REGION: z.string().optional().default('auto'),
   S3_BUCKET: z.string().optional().default(''),
@@ -115,8 +117,11 @@ const isVercel = process.env.VERCEL === '1';
  */
 if (isVercel && raw.NODE_ENV === 'production') {
   const problems: string[] = [];
-  if (raw.STORAGE_DRIVER !== 's3') {
-    problems.push('STORAGE_DRIVER=s3 مطلوب على Vercel (AWS S3 أو Cloudflare R2) مع S3_BUCKET ومفاتيح الوصول');
+  if (!['s3', 'blob'].includes(raw.STORAGE_DRIVER)) {
+    problems.push('STORAGE_DRIVER=s3 أو blob مطلوب على Vercel لتخزين الملفات بصورة دائمة');
+  }
+  if (raw.STORAGE_DRIVER === 'blob' && !raw.BLOB_READ_WRITE_TOKEN) {
+    problems.push('BLOB_READ_WRITE_TOKEN مطلوب عند استخدام Vercel Blob');
   }
   if (/^mongodb(\+srv)?:\/\/(localhost|127\.0\.0\.1)/i.test(raw.MONGODB_URI)) {
     problems.push('MONGODB_URI يجب أن يشير إلى MongoDB Atlas وليس localhost على Vercel');

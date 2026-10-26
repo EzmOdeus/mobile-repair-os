@@ -7,7 +7,7 @@
       "buildCommand": "npm run build",
       "functions": {
         "server.js": {
-          "includeFiles": "{assets,docs}/**",
+          "includeFiles": "{assets/**,docs/**,package.json}",
           "maxDuration": 60
         }
       }

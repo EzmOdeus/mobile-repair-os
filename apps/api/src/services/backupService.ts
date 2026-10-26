@@ -428,7 +428,7 @@ export async function runScheduledBackup(): Promise<BackupRunResult> {
   // تضيع مع أول Cold Start. نطلب نسخ المزوّد/Atlas بدل الإيهام بنسخة ناجحة.
   if (env.isVercel) {
     throw ApiError.businessRule(
-      'النسخ الاحتياطي المحلي غير متاح على Vercel. استخدم النسخ التلقائي من MongoDB Atlas أو شغّل النسخ على خادم دائم، مع STORAGE_DRIVER=s3 للملفات.',
+      'النسخ الاحتياطي المحلي غير متاح على Vercel. استخدم النسخ التلقائي من MongoDB Atlas أو شغّل النسخ على خادم دائم، مع STORAGE_DRIVER=blob أو s3 للملفات.',
     );
   }
 

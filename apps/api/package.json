@@ -28,6 +28,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1146.0",
+    "@vercel/blob": "2.8.2",
     "bcryptjs": "3.0.3",
     "bidi-js": "1.0.3",
     "compression": "1.8.1",

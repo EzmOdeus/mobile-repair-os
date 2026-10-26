@@ -1,5 +1,6 @@
 {
   "name": "mobile-repair-os",
+  "type": "module",
   "private": true,
   "version": "1.0.0",
   "description": "Mobile Repair OS Egypt - منصة إدارة وتشغيل مراكز صيانة الموبايل (Express + MongoDB + Next.js)",
